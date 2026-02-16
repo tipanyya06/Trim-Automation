@@ -1,0 +1,38 @@
+streamlit>=1.31.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+xlsxwriter>=3.1.0
+pdfplumber>=0.11.0
+camelot-py[cv]>=0.11.0
+tabula-py>=2.8.1
+PyMuPDF>=1.23.0
+
+"""
+================================================================================
+SETUP INSTRUCTIONS — Run these commands in your terminal before starting
+================================================================================
+
+STEP 1 — Check Python is installed:
+    python --version
+    (If you get an error, download Python from https://python.org first)
+
+STEP 2 — Install all dependencies:
+    pip install streamlit pandas openpyxl pdfplumber xlsxwriter
+
+    If pip isn't recognized, use:
+    python -m pip install streamlit pandas openpyxl pdfplumber xlsxwriter
+
+STEP 3 — Run the app:
+    cd bom_automation
+    streamlit run app.py
+
+    If streamlit isn't recognized, use:
+    python -m streamlit run app.py
+
+STEP 4 — If using a virtual environment (.venv):
+    .venv\Scripts\activate
+    pip install streamlit pandas openpyxl pdfplumber xlsxwriter
+    streamlit run app.py
+
+================================================================================
+"""
