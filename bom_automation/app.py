@@ -7,6 +7,8 @@ from exporters.excel_exporter import export_to_excel
 from exporters.csv_exporter import export_to_csv
 from parsers.pdf_parser import parse_bom_pdf
 from validators.filler import validate_and_fill
+from validators.matcher import auto_detect_columns
+
 
 st.set_page_config(
     page_title="Columbia BOM Automation",
@@ -396,6 +398,45 @@ def _read_comparison_file(file) -> pd.DataFrame:
     return df
 
 
+
+def _get_label_components_from_spec(bom_data: dict) -> dict:
+    """
+    Scan color_specification for label/care-related components.
+    Returns dict like:
+      {
+        "main_label": {"component": "Label 1 - 003287", "colors": {"010-Black": "White, Black", ...}},
+        "care_label": {"component": "Label 1 - 003287", "colors": {...}},
+        "label_logo": {"component": "Label Logo 1 - 075660", "colors": {...}},
+      }
+    """
+    result = {}
+    cs = bom_data.get("color_specification")
+    if cs is None or cs.empty:
+        return result
+
+    comp_col = cs.columns[0]
+    colorway_cols = [c for c in cs.columns[1:] if c and not c.startswith("col_")]
+
+    for _, row in cs.iterrows():
+        comp = str(row[comp_col]).strip()
+        comp_lower = comp.lower()
+
+        # Build color mapping for this component
+        colors = {}
+        for cw in colorway_cols:
+            val = str(row.get(cw, "")).strip()
+            if val and val.lower() not in ("none", "nan", ""):
+                colors[cw] = val
+
+        # Classify by keyword priority
+        if "label logo" in comp_lower or "logo label" in comp_lower:
+            result.setdefault("label_logo", {"component": comp, "colors": colors})
+        elif "label" in comp_lower and "care" not in comp_lower:
+            result.setdefault("main_label", {"component": comp, "colors": colors})
+            result.setdefault("care_label", {"component": comp, "colors": colors})
+
+    return result
+
 def render_comparison_tab():
     render_section_header("BOM Comparison & Validation", "Auto-fill trim & label data from BOM")
 
@@ -421,19 +462,83 @@ def render_comparison_tab():
                         color:#5a6080; margin-bottom:0.75rem;">Column Mapping</div>
             """, unsafe_allow_html=True)
 
+            # Import at the top of the file instead
+            from validators.matcher import auto_detect_columns
+
+            # Auto-detect
+            auto = auto_detect_columns(comp_df)
+            if auto and auto["confidence"] >= 0.7:
+                default_style = auto["style_col"]
+                default_color = auto["color_col"]
+                render_info_banner(f"Auto-detected: Style='{default_style}', Color='{default_color}'")
+            else:
+                default_style = list(comp_df.columns)[0]
+                default_color = list(comp_df.columns)[1] if len(comp_df.columns) > 1 else list(comp_df.columns)[0]
+
             col_a, col_b = st.columns(2)
             with col_a:
                 style_col = st.selectbox(
                     "Buyer Style Number column",
                     options=list(comp_df.columns),
-                    help="Column containing the style code e.g. CL2880"
+                    index=list(comp_df.columns).index(default_style) if default_style in comp_df.columns else 0
                 )
             with col_b:
                 color_col = st.selectbox(
                     "Color / Option column",
                     options=list(comp_df.columns),
-                    help="Column containing colorway e.g. 010, Black, 278-Dark Stone"
+                    index=list(comp_df.columns).index(default_color) if default_color in comp_df.columns else 0
                 )
+
+            # ── Label / Care Label from Color Specification ───────────────────
+            label_components = _get_label_components_from_spec(st.session_state["bom_data"])
+            cs = st.session_state["bom_data"].get("color_specification")
+            if cs is not None and not cs.empty:
+                comp_col_name = cs.columns[0]
+                all_components = [str(r).strip() for r in cs[comp_col_name] if str(r).strip() and str(r).strip().lower() not in ("none","nan","")]
+
+                default_main  = label_components.get("main_label",  {}).get("component", all_components[0] if all_components else None)
+                default_care  = label_components.get("care_label",  {}).get("component", all_components[0] if all_components else None)
+
+                st.markdown("""
+                <div style="font-size:0.68rem; text-transform:uppercase; letter-spacing:0.1em;
+                            color:#5a6080; margin-top:1rem; margin-bottom:0.75rem;">Label Mapping from Color Specification</div>
+                """, unsafe_allow_html=True)
+
+                col_c, col_d = st.columns(2)
+                with col_c:
+                    main_label_comp = st.selectbox(
+                        "Main Label component",
+                        options=all_components,
+                        index=all_components.index(default_main) if default_main in all_components else 0
+                    )
+                with col_d:
+                    care_label_comp = st.selectbox(
+                        "Care Label component",
+                        options=all_components,
+                        index=all_components.index(default_care) if default_care in all_components else 0
+                    )
+
+                # Show detected color values as info
+                if main_label_comp:
+                    main_row = cs[cs[comp_col_name] == main_label_comp]
+                    if not main_row.empty:
+                        colorway_cols = [c for c in cs.columns[1:] if c and not c.startswith("col_")]
+                        sample_colors = {cw: str(main_row.iloc[0].get(cw,"")).strip() for cw in colorway_cols[:3]}
+                        sample_str = ", ".join(f"{k}: {v}" for k,v in sample_colors.items() if v and v.lower() not in ("none","nan",""))
+                        if sample_str:
+                            render_info_banner(f"Main Label colors → {sample_str}")
+
+                if care_label_comp:
+                    care_row = cs[cs[comp_col_name] == care_label_comp]
+                    if not care_row.empty:
+                        colorway_cols = [c for c in cs.columns[1:] if c and not c.startswith("col_")]
+                        sample_colors = {cw: str(care_row.iloc[0].get(cw,"")).strip() for cw in colorway_cols[:3]}
+                        sample_str = ", ".join(f"{k}: {v}" for k,v in sample_colors.items() if v and v.lower() not in ("none","nan",""))
+                        if sample_str:
+                            render_info_banner(f"Care Label colors → {sample_str}")
+
+                st.session_state["selected_main_label_comp"] = main_label_comp
+                st.session_state["selected_care_label_comp"] = care_label_comp
 
             render_divider()
             render_table_meta(comp_df)
@@ -442,12 +547,17 @@ def render_comparison_tab():
             render_divider()
             if st.button("▶ Run Validation & Auto-Fill"):
                 with st.spinner("Matching BOM data and filling columns..."):
+                    # Pass selected label components into bom_data for filler to use
+                    bom_data_with_labels = dict(st.session_state["bom_data"])
+                    bom_data_with_labels["selected_main_label_comp"] = st.session_state.get("selected_main_label_comp")
+                    bom_data_with_labels["selected_care_label_comp"] = st.session_state.get("selected_care_label_comp")
+
                     result_df = validate_and_fill(
                         comparison_df=comp_df.rename(columns={
                             style_col: "Buyer Style Number",
                             color_col: "Color/Option"
                         }),
-                        bom_data=st.session_state["bom_data"],
+                        bom_data=bom_data_with_labels,
                     )
                     st.session_state["validation_result"] = result_df
 

@@ -1,4 +1,5 @@
-from typing import Optional, List
+from typing import Optional, List, Dict
+import pandas as pd
 
 KNOWN_COLORWAYS = {
     "010": {"name": "Black",          "full": "010-Black"},
@@ -20,6 +21,43 @@ COMPONENT_ALIASES = {
     "Packaging 3":          ["upc sticker", "upc bag sticker", "packaging 3"],
     "Packaging 4":          ["outer carton", "carton", "packaging 4"],
 }
+
+
+def auto_detect_columns(df: pd.DataFrame) -> Optional[Dict[str, str]]:
+    """
+    Auto-detect style and color columns from a comparison DataFrame.
+    Returns {"style_col": str, "color_col": str, "confidence": float} or None if uncertain.
+    """
+    cols_lower = {c.lower(): c for c in df.columns}
+    
+    # Style patterns
+    style_patterns = ["style", "buyer style", "item", "sku", "product code", "article"]
+    style_col = None
+    for pattern in style_patterns:
+        for lower_col, original_col in cols_lower.items():
+            if pattern in lower_col:
+                style_col = original_col
+                break
+        if style_col:
+            break
+    
+    # Color patterns
+    color_patterns = ["color", "option", "colorway", "variant", "shade"]
+    color_col = None
+    for pattern in color_patterns:
+        for lower_col, original_col in cols_lower.items():
+            if pattern in lower_col and "description" not in lower_col:
+                color_col = original_col
+                break
+        if color_col:
+            break
+    
+    if style_col and color_col:
+        return {"style_col": style_col, "color_col": color_col, "confidence": 0.9}
+    elif style_col or color_col:
+        return {"style_col": style_col, "color_col": color_col, "confidence": 0.5}
+    else:
+        return None
 
 
 def normalize_colorway(color_option_value: str, available_colorways: Optional[List[str]] = None) -> Optional[str]:
@@ -49,7 +87,7 @@ def normalize_colorway(color_option_value: str, available_colorways: Optional[Li
     # 3. Starts with known number prefix (e.g. "010", "010-Black")
     for cw in available_colorways:
         prefix = cw.split("-")[0]
-        if val_lower.startswith(prefix):
+        if val_lower.startswith(prefix.lower()):
             return cw
 
     # 4. Substring match on color name part (after the dash)
@@ -86,3 +124,41 @@ def normalize_component(component_name: str) -> str:
                 return canonical
 
     return component_name
+
+
+def extract_material_code(text: str) -> str:
+    """
+    Extract ONLY the material code (first 3-6 digit number) from any description.
+    Examples:
+      "003287 - 33mm Columbia Bug..." → "003287"
+      "Label Logo (075660) Metal..." → "075660"
+    """
+    import re
+    if not text:
+        return ""
+    
+    # Look for 3-6 digit numbers
+    matches = re.findall(r'\b(\d{3,6})\b', str(text))
+    return matches[0] if matches else ""
+
+
+def extract_id_only(value: str) -> str:
+    """
+    Extract ONLY the ID (first token) from a full description.
+    Examples:
+      "980010 UPC Bag Sticker Generic..." → "980010"
+      "003287 33mm Columbia Bug..." → "003287"
+      "N/A" → "N/A"
+    """
+    if not value or value == "N/A":
+        return value
+    
+    text = str(value).strip()
+    if not text:
+        return "N/A"
+    
+    # Get the first token (space-separated)
+    first_token = text.split()[0] if text.split() else text
+    
+    # Return just the ID part, removing any trailing punctuation
+    return first_token.rstrip('.,;:-()')

@@ -12,6 +12,17 @@ KNOWN_COLORWAYS = {
 }
 
 
+def _fix_broken_words(text: str) -> str:
+    """Fix words broken across lines by PDF extraction (e.g. 'Internatio nal' → 'International')."""
+    import re
+    # Join lines within a cell, collapsing internal newlines
+    text = text.replace("\n", " ")
+    # Fix words split by newline: "Internatio nal" - these appear as two fragments
+    # This is tricky to fix perfectly, so we just collapse extra spaces
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
+
+
 def _clean_table(rows):
     cleaned = []
     for r in rows or []:
@@ -72,9 +83,12 @@ def _detect_section(page_text: str) -> str:
         return "colorless_bom"
     if "color specification" in txt:
         return "color_specification"
-    if "costing bom" in txt and ("summary" in txt or "total fob" in txt):
-        return "costing_summary"
-    if "costing bom" in txt or "costing detail" in txt:
+    # For costing, prefer detail if we see material/supplier columns
+    if "costing" in txt:
+        # If it mentions "summary" but NOT component/material/supplier detail, it's a summary
+        if "summary" in txt and "material" not in txt:
+            return "costing_summary"
+        # Otherwise assume it's detail (has Component, Material, Supplier columns)
         return "costing_detail"
     if "care report" in txt:
         return "care_report"
@@ -109,6 +123,21 @@ def _extract_metadata(first_page_text: str) -> Dict[str, Any]:
     return meta
 
 
+def _is_costing_detail_table(table: list) -> bool:
+    """Check if a table has Component/Material/Supplier columns (the real BOM detail)."""
+    if not table:
+        return False
+    for row in table[:3]:
+        if row is None:
+            continue
+        row_strs = [str(c).replace("\n", " ").strip().lower() for c in row if c is not None]
+        if "material" in row_strs and "supplier" in row_strs:
+            return True
+        if "component" in row_strs and "material" in row_strs:
+            return True
+    return False
+
+
 def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
     result: Dict[str, Any] = {"metadata": {}}
 
@@ -119,6 +148,9 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
         first_text = pdf.pages[0].extract_text() or ""
         result["metadata"] = _extract_metadata(first_text)
 
+        # We collect costing detail separately with special handling
+        costing_detail_rows: list = []
+        costing_detail_header: list = None  # known column headers once discovered
         tables_by_section: Dict[str, list] = {}
 
         for page in pdf.pages:
@@ -138,8 +170,80 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
             for tbl in page_tables:
                 if not tbl:
                     continue
-                tables_by_section.setdefault(section, [])
-                tables_by_section[section].append(tbl)
+
+                # Special handling: detect real costing detail tables by their columns
+                if section == "costing_detail" and _is_costing_detail_table(tbl):
+                    # Find the header row (has "Material" and "Supplier")
+                    header_idx = 0
+                    for ri, row in enumerate(tbl[:3]):
+                        if row is None:
+                            continue
+                        row_strs = [str(c).replace("\n", " ").strip().lower() for c in row if c is not None]
+                        if "material" in row_strs and "supplier" in row_strs:
+                            header_idx = ri
+                            break
+
+                    cleaned_header = [(str(c).replace("\n", " ").strip() if c is not None else "") for c in tbl[header_idx]]
+                    if costing_detail_header is None:
+                        costing_detail_header = cleaned_header
+
+                    num_cols = len(costing_detail_header)
+                    for row in tbl[header_idx + 1:]:
+                        if row is None:
+                            continue
+                        cleaned = [(str(c).replace("\n", " ").strip() if c is not None else "") for c in row]
+                        # Pad/trim
+                        if len(cleaned) < num_cols:
+                            cleaned += [""] * (num_cols - len(cleaned))
+                        elif len(cleaned) > num_cols:
+                            cleaned = cleaned[:num_cols]
+                        costing_detail_rows.append(cleaned)
+
+                elif section == "costing_detail":
+                    # This is a costing page but with continuation data rows (no header)
+                    # If we already know the header, use it; otherwise skip
+                    if costing_detail_header is not None:
+                        num_cols = len(costing_detail_header)
+                        for row in tbl:
+                            if row is None:
+                                continue
+                            cleaned = [(str(c).replace("\n", " ").strip() if c is not None else "") for c in row]
+                            # Skip rows that look like the big metadata header block (very few non-empty cells)
+                            non_empty = sum(1 for c in cleaned if c)
+                            if non_empty < 3:
+                                continue
+                            # Skip the metadata header rows that start with "Costing BOM"
+                            first_cell = cleaned[0] if cleaned else ""
+                            if "costing bom" in first_cell.lower() or "line slot" in first_cell.lower():
+                                continue
+                            # Pad/trim
+                            if len(cleaned) < num_cols:
+                                cleaned += [""] * (num_cols - len(cleaned))
+                            elif len(cleaned) > num_cols:
+                                cleaned = cleaned[:num_cols]
+                            costing_detail_rows.append(cleaned)
+                else:
+                    tables_by_section.setdefault(section, [])
+                    tables_by_section[section].append(tbl)
+
+        # Build costing_detail DataFrame from collected rows
+        if costing_detail_header and costing_detail_rows:
+            # Build unique header
+            header = []
+            seen = {}
+            for c in costing_detail_header:
+                name = c if c else f"col_{len(header)}"
+                if name in seen:
+                    seen[name] += 1
+                    name = f"{name}_{seen[name]}"
+                else:
+                    seen[name] = 0
+                header.append(name)
+            df = pd.DataFrame(costing_detail_rows, columns=header)
+            df = df[~(df.eq("").all(axis=1))]
+            result["costing_detail"] = df
+        else:
+            result["costing_detail"] = pd.DataFrame()
 
         for section, tables in tables_by_section.items():
             all_rows = []
@@ -169,4 +273,84 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
     ]:
         result.setdefault(key, pd.DataFrame())
 
+    # Build supplier lookup from costing_detail if available
+    supplier_lookup = _build_supplier_lookup(result.get("costing_detail", pd.DataFrame()))
+    result["supplier_lookup"] = supplier_lookup
+
     return result
+
+
+def _build_supplier_lookup(costing_detail_df: pd.DataFrame) -> Dict[str, str]:
+    """
+    Extract supplier information from costing_detail DataFrame.
+    Returns {material_code: supplier_name} mapping.
+    """
+    if costing_detail_df is None or costing_detail_df.empty:
+        return {}
+    
+    lookup = {}
+    df = costing_detail_df.copy()
+    
+    # Normalize column names
+    df.columns = [str(c).lower().strip() for c in df.columns]
+    
+    # Find material and supplier columns
+    material_col = None
+    supplier_col = None
+    
+    for col in df.columns:
+        if col == "material":
+            material_col = col
+        if col == "supplier":
+            supplier_col = col
+    
+    # If not found by exact name, try contains match
+    if not material_col:
+        for col in df.columns:
+            if "material" in col:
+                material_col = col
+                break
+    
+    if not supplier_col:
+        for col in df.columns:
+            if "supplier" in col or "vendor" in col:
+                supplier_col = col
+                break
+    
+    # Build lookup table
+    if material_col and supplier_col and material_col in df.columns and supplier_col in df.columns:
+        import re
+
+        def _clean_supplier(s: str) -> str:
+            """Fix words broken by PDF line extraction e.g. 'Internatio nal' → 'International'."""
+            prev = None
+            while prev != s:
+                prev = s
+                s = re.sub(r'([a-z]) ([a-z])', lambda m: m.group(1) + m.group(2), s)
+            return s
+
+        for _, row in df.iterrows():
+            mat = str(row.get(material_col, '')).strip()
+            supp = _clean_supplier(str(row.get(supplier_col, '')).strip())
+            
+            # Extract material code if cell contains descriptive text
+            match = re.search(r'\b(\d{3,6})\b', mat)
+            if match:
+                mat_code = match.group(1)
+                # Only skip truly empty/NaN values — all real supplier names are valid
+                if supp and supp.lower() not in ("", "nan", "none"):
+                    lookup[mat_code] = supp
+
+            # Fallback: if material col is empty, try extracting code from description col
+            if not match:
+                desc_cols = [c for c in df.columns if "description" in c]
+                for dc in desc_cols:
+                    desc_val = str(row.get(dc, '')).strip()
+                    m2 = re.search(r'\b(\d{3,6})\b', desc_val)
+                    if m2:
+                        mat_code = m2.group(1)
+                        if supp and supp.lower() not in ("", "nan", "none"):
+                            lookup[mat_code] = supp
+                        break
+    
+    return lookup
