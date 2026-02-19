@@ -48,18 +48,44 @@ def _rows_to_df(rows: list) -> pd.DataFrame:
 
 def _detect_section(page_text: str) -> str:
     txt = page_text.lower()
-    if "color bom" in txt:              return "color_bom"
-    if "colorless bom" in txt:         return "colorless_bom"
-    if "color specification" in txt:   return "color_specification"
-    if "costing" in txt:
-        if "summary" in txt and "material" not in txt:
-            return "costing_summary"
-        return "costing_detail"
-    if "care report" in txt:           return "care_report"
-    if "content report" in txt:        return "content_report"
-    if "measurement" in txt:           return "measurements"
-    if "sales sample" in txt:          return "sales_sample"
-    if "hangtag" in txt:               return "hangtag_report"
+    # Only look at the first 5 lines for section title detection
+    # This avoids false positives from cell content like "Costing BOM Line Slot"
+    first_lines = "\n".join(page_text.lower().splitlines()[:5])
+    first_lines_nsp = re.sub(r'\s+', '', first_lines)
+
+    # Check full text for clearly named sections
+    if "color bom" in txt:
+        return "color_bom"
+    if "colorless bom" in txt:
+        return "colorless_bom"
+    if "color specification" in txt:
+        return "color_specification"
+
+    # Costing: ONLY check the first few lines for the section title
+    # to avoid false positives from cell text like "Costing BOM Line Slot"
+    _costing_keywords = [
+        "costing detail", "costing bom", "cost detail", "cost bom",
+        "costing summary", "costingdetail", "costingbom",
+    ]
+    _is_costing = (
+        any(kw in first_lines for kw in _costing_keywords)
+        or "costing" in first_lines_nsp
+    )
+    if _is_costing:
+        _is_summary = "summary" in first_lines and "material" not in txt and "supplier" not in txt
+        return "costing_summary" if _is_summary else "costing_detail"
+
+    if "care report" in txt:
+        return "care_report"
+    if "content report" in txt:
+        return "content_report"
+    if "measurement" in txt:
+        return "measurements"
+    if "sales sample" in txt:
+        return "sales_sample"
+    if "hangtag" in txt:
+        return "hangtag_report"
+
     return "unknown"
 
 
@@ -91,15 +117,124 @@ def _extract_metadata(first_page_text: str) -> Dict[str, Any]:
 
 
 def _is_costing_detail_table(table: list) -> bool:
-    for row in table[:3]:
+    """Return True if table looks like a costing detail (has Material + Supplier headers)."""
+    for row in table[:5]:
         if row is None:
             continue
         row_strs = [str(c).replace("\n", " ").strip().lower() for c in row if c is not None]
+        row_joined = " ".join(row_strs)
         if "material" in row_strs and "supplier" in row_strs:
             return True
         if "component" in row_strs and "material" in row_strs:
             return True
+        if "material" in row_joined and "supplier" in row_joined:
+            return True
     return False
+
+
+def _fix_split_text(s: str) -> str:
+    """Fix OCR split words. Only merges single uppercase letters (Y K K -> YKK)
+    and clearly broken mid-word splits. Does NOT merge normal words."""
+    if not s:
+        return s
+    # Fix "Y K K" → "YKK" (single capital letters separated by spaces)
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r'(?<![a-zA-Z])([A-Z]) ([A-Z])(?![a-zA-Z])', r'\1\2', s)
+    # Fix mid-word splits like "Internatio nal" → "International"
+    # Only merge when the second part starts lowercase and is clearly a suffix
+    s = re.sub(r'([a-zA-Z]{4,})  ?([a-z]{2,5})(?=\s|$)',
+               lambda m: m.group(1) + m.group(2) if len(m.group(2)) <= 4 else m.group(0), s)
+    return s.strip()
+
+
+def _extract_codes_from_cell(cell_str: str) -> set:
+    """Extract all plausible 3-7 digit material codes from a cell string."""
+    codes = set()
+    s = str(cell_str).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return codes
+    for m in re.finditer(r'(?<!\d)(\d{3,7})(?!\d)', s):
+        raw = m.group(1)
+        codes.add(raw)
+        stripped = raw.lstrip("0")
+        if stripped:
+            codes.add(stripped)
+    digits_only = re.sub(r'[^\d]', '', s)
+    if 3 <= len(digits_only) <= 7:
+        codes.add(digits_only)
+        codes.add(digits_only.lstrip("0"))
+    return codes
+
+
+def _build_supplier_lookup(costing_detail_df: pd.DataFrame) -> Dict[str, str]:
+    """Build {material_code: supplier_name} from costing detail, registering zero-stripped variants."""
+    if costing_detail_df is None or costing_detail_df.empty:
+        return {}
+
+    lookup: Dict[str, str] = {}
+    df = costing_detail_df.copy()
+    norm_cols = [str(c).lower().strip() for c in df.columns]
+    original_cols = list(df.columns)
+
+    supplier_idx = None
+    for i, c in enumerate(norm_cols):
+        if c == "supplier":
+            supplier_idx = i
+            break
+    if supplier_idx is None:
+        for i, c in enumerate(norm_cols):
+            if "supplier" in c or "vendor" in c:
+                supplier_idx = i
+                break
+    if supplier_idx is None:
+        return {}
+
+    supplier_col = original_cols[supplier_idx]
+
+    material_col = None
+    for i, c in enumerate(norm_cols):
+        if c == "material":
+            material_col = original_cols[i]
+            break
+    if material_col is None:
+        for i, c in enumerate(norm_cols):
+            if "material" in c:
+                material_col = original_cols[i]
+                break
+
+    def _register(code: str, supplier: str):
+        for key in {code, code.lstrip("0")}:
+            if not key:
+                continue
+            if key not in lookup:
+                lookup[key] = supplier
+            elif len(supplier) > len(lookup[key]):
+                lookup[key] = supplier
+
+    for _, row in df.iterrows():
+        supplier_raw = str(row.get(supplier_col, "")).strip()
+        if not supplier_raw or supplier_raw.lower() in ("nan", "none", ""):
+            continue
+
+        supplier = _fix_split_text(supplier_raw)
+
+        found_codes: set = set()
+        if material_col:
+            mat_cell = str(row.get(material_col, "")).strip()
+            found_codes = _extract_codes_from_cell(mat_cell)
+
+        if not found_codes:
+            for col in original_cols:
+                if col == supplier_col:
+                    continue
+                found_codes.update(_extract_codes_from_cell(str(row.get(col, ""))))
+
+        for code in found_codes:
+            _register(code, supplier)
+
+    return lookup
 
 
 def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
@@ -131,9 +266,11 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
             for tbl in page_tables:
                 if not tbl:
                     continue
+
                 if section == "costing_detail" and _is_costing_detail_table(tbl):
+                    # Real costing table — extract header + rows
                     header_idx = 0
-                    for ri, row in enumerate(tbl[:3]):
+                    for ri, row in enumerate(tbl[:5]):
                         if row is None:
                             continue
                         row_strs = [str(c).replace("\n", " ").strip().lower() for c in row if c is not None]
@@ -150,24 +287,44 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
                         cleaned = [(str(c).replace("\n", " ").strip() if c is not None else "") for c in row]
                         cleaned = (cleaned + [""] * num_cols)[:num_cols]
                         costing_detail_rows.append(cleaned)
+
                 elif section == "costing_detail" and costing_detail_header:
+                    # Continuation page — skip repeated header if present
+                    tbl_data = tbl
+                    if _is_costing_detail_table(tbl):
+                        start_idx = 1
+                        for ri, row in enumerate(tbl[:5]):
+                            if row is None:
+                                continue
+                            row_strs = [str(c).replace("\n", " ").strip().lower() for c in row if c is not None]
+                            if "material" in row_strs and "supplier" in row_strs:
+                                start_idx = ri + 1
+                                break
+                        tbl_data = tbl[start_idx:]
+
                     num_cols = len(costing_detail_header)
-                    for row in tbl:
+                    for row in tbl_data:
                         if row is None:
                             continue
                         cleaned = [(str(c).replace("\n", " ").strip() if c is not None else "") for c in row]
                         non_empty = sum(1 for c in cleaned if c)
-                        if non_empty < 3:
+                        if non_empty < 2:
                             continue
                         first_cell = cleaned[0] if cleaned else ""
                         if "costing bom" in first_cell.lower() or "line slot" in first_cell.lower():
                             continue
                         cleaned = (cleaned + [""] * num_cols)[:num_cols]
                         costing_detail_rows.append(cleaned)
+
+                elif section == "costing_detail":
+                    # Page is classified as costing but table has no Material/Supplier headers
+                    # — it's a non-data table on a costing page (e.g. colorway list in page header).
+                    # Do NOT store it anywhere — skip it entirely.
+                    pass
+
                 else:
                     tables_by_section.setdefault(section, []).append(tbl)
 
-        # Build costing_detail
         if costing_detail_header and costing_detail_rows:
             header, seen = [], {}
             for c in costing_detail_header:
@@ -203,105 +360,3 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
 
     result["supplier_lookup"] = _build_supplier_lookup(result.get("costing_detail", pd.DataFrame()))
     return result
-
-
-def _fix_split_text(s: str) -> str:
-    """
-    Fix OCR/PDF text extraction artifacts where words get split character-by-character.
-    Examples:
-      'Y K K'      → 'YKK'
-      'bel cro'    → 'belcro'   (only merges 1-2 char tokens)
-      'Avery Den  nison' → 'Avery Dennison'
-    """
-    if not s:
-        return s
-
-    # Fix ALL-CAPS letter sequences like "Y K K" → "YKK"
-    s = re.sub(r'\b([A-Z]) ([A-Z])\b', r'\1\2', s)
-    s = re.sub(r'\b([A-Z]{2,}) ([A-Z])\b', r'\1\2', s)
-
-    # Fix split lowercase tokens of 1-3 chars: "bel cro" → "belcro"
-    s = re.sub(r'\b([a-z]{1,3}) ([a-z]{1,3})\b', lambda m: m.group(1) + m.group(2), s)
-
-    # Fix split in middle of words: "Den  nison" → "Dennison"
-    s = re.sub(r'([a-zA-Z]{2,})\s{1,2}([a-z]{2,})', lambda m: m.group(1) + m.group(2), s)
-
-    return s.strip()
-
-
-def _build_supplier_lookup(costing_detail_df: pd.DataFrame) -> Dict[str, str]:
-    """
-    Build {material_code → supplier_name} from costing detail.
-
-    Scans ALL columns in every row for 3-6 digit codes.
-    If the dedicated material column has codes, use only those (most precise).
-    Keeps the longest/most informative supplier name on conflicts.
-    """
-    if costing_detail_df is None or costing_detail_df.empty:
-        return {}
-
-    lookup: Dict[str, str] = {}
-    df = costing_detail_df.copy()
-    norm_cols = [str(c).lower().strip() for c in df.columns]
-    original_cols = list(df.columns)
-
-    # Locate supplier column
-    supplier_idx = None
-    for i, c in enumerate(norm_cols):
-        if c == "supplier":
-            supplier_idx = i
-            break
-    if supplier_idx is None:
-        for i, c in enumerate(norm_cols):
-            if "supplier" in c or "vendor" in c:
-                supplier_idx = i
-                break
-    if supplier_idx is None:
-        return {}
-
-    supplier_col = original_cols[supplier_idx]
-
-    # Locate material column (preferred source of codes)
-    material_col = None
-    for i, c in enumerate(norm_cols):
-        if c == "material":
-            material_col = original_cols[i]
-            break
-    if material_col is None:
-        for i, c in enumerate(norm_cols):
-            if "material" in c:
-                material_col = original_cols[i]
-                break
-
-    for _, row in df.iterrows():
-        supplier_raw = str(row.get(supplier_col, "")).strip()
-        if not supplier_raw or supplier_raw.lower() in ("nan", "none", ""):
-            continue
-
-        supplier = _fix_split_text(supplier_raw)
-
-        # If material column has a code, use only that — most accurate
-        found_codes: set = set()
-        if material_col:
-            mat_cell = str(row.get(material_col, "")).strip()
-            mat_codes = re.findall(r'\b(\d{3,6})\b', mat_cell)
-            if mat_codes:
-                found_codes = set(mat_codes)
-
-        # Fallback: scan every cell in the row
-        if not found_codes:
-            for col in original_cols:
-                if col == supplier_col:
-                    continue
-                cell = str(row.get(col, "")).strip()
-                codes = re.findall(r'\b(\d{3,6})\b', cell)
-                found_codes.update(codes)
-
-        for code in found_codes:
-            if code not in lookup:
-                lookup[code] = supplier
-            elif len(supplier) > len(lookup[code]):
-                # Prefer the more descriptive supplier name
-                lookup[code] = supplier
-
-    return lookup

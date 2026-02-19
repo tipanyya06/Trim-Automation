@@ -1,3 +1,4 @@
+import re
 import io
 import pandas as pd
 import streamlit as st
@@ -134,7 +135,7 @@ def render_sidebar():
             """)
 
         render_divider()
-        if st.button("🗑 Clear All Data", width='stretch'):
+        if st.button("🗑 Clear All Data", use_container_width=True):
             for k in ["bom_dict", "comparison_raw", "validation_result",
                       "label_selections"]:
                 st.session_state.pop(k, None)
@@ -195,7 +196,7 @@ def render_pdf_tab():
             "Sections":     len(sections_with_data),
             "Colorways":    len(bom.get("color_bom", pd.DataFrame()).columns) if not bom.get("color_bom", pd.DataFrame()).empty else 0,
         })
-    st.dataframe(pd.DataFrame(summary_rows), width='stretch', height=min(80 + 35 * len(summary_rows), 300))
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, height=min(80 + 35 * len(summary_rows), 300))
 
     # ── Inspect individual BOM ────────────────────────────────────────────────
     render_divider()
@@ -230,13 +231,13 @@ def render_pdf_tab():
         )]
 
     render_table_meta(view_df)
-    st.dataframe(view_df, width='stretch', height=380)
+    st.dataframe(view_df, use_container_width=True, height=380)
 
     render_divider()
     c1, c2 = st.columns(2)
     with c1:
         st.download_button("⬇ Export Section → CSV", data=export_to_csv(view_df),
-                           file_name=f"{selected_style}_{section}.csv", mime="text/csv", width='stretch')
+                           file_name=f"{selected_style}_{section}.csv", mime="text/csv", use_container_width=True)
     with c2:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
@@ -245,41 +246,9 @@ def render_pdf_tab():
         st.download_button("⬇ Export All Sections → Excel", data=buf.getvalue(),
                            file_name=f"{selected_style}_sections.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           width='stretch')
+                           use_container_width=True)
 
-    # ── Supplier Lookup Debug Panel ───────────────────────────────────────────
-    render_divider()
-    with st.expander("🔍 Debug: Supplier Lookup & Costing Detail", expanded=False):
-        supplier_lookup = bom_data.get("supplier_lookup", {})
-        costing_df = bom_data.get("costing_detail", pd.DataFrame())
 
-        col_dbg1, col_dbg2 = st.columns(2)
-        with col_dbg1:
-            st.markdown(
-                f"""<div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.1em;
-                color:#5a6080;margin-bottom:0.5rem;">Supplier Lookup Dict
-                <span style="color:#3b82f6;">({len(supplier_lookup)} entries)</span></div>""",
-                unsafe_allow_html=True)
-            if supplier_lookup:
-                lookup_df = pd.DataFrame(
-                    [{"Material Code": k, "Supplier": v} for k, v in sorted(supplier_lookup.items())]
-                )
-                st.dataframe(lookup_df, width='stretch', height=300)
-            else:
-                st.warning("⚠ Supplier lookup is EMPTY — costing detail may not have been parsed correctly.")
-
-        with col_dbg2:
-            ncols = len(costing_df.columns) if not costing_df.empty else 0
-            st.markdown(
-                f"""<div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.1em;
-                color:#5a6080;margin-bottom:0.5rem;">Costing Detail
-                <span style="color:#3b82f6;">({len(costing_df)} rows, {ncols} cols)</span></div>""",
-                unsafe_allow_html=True)
-            if not costing_df.empty:
-                st.markdown(f"**Columns:** `{list(costing_df.columns)}`")
-                st.dataframe(costing_df.head(30), width='stretch', height=300)
-            else:
-                st.warning("⚠ Costing detail DataFrame is EMPTY — check PDF section detection.")
 
 
 # ── Helpers for label component extraction ───────────────────────────────────
@@ -415,8 +384,26 @@ def render_comparison_tab():
         )
 
         saved = label_selections.get(style_key, {})
-        default_main = saved.get("main_label", components[0])
-        default_care = saved.get("care_label", components[0])
+
+        # Smart defaults: "Label Logo 1" for Main Label, "Label 1" for Care Label
+        # Priority: 1) previously saved user selection  2) preferred name match  3) first item
+        def _best_default(saved_val, preferred_names):
+            if saved_val and saved_val in components:
+                return saved_val
+            for preferred in preferred_names:
+                for comp in components:
+                    if preferred.lower() in comp.lower():
+                        return comp
+            return components[0]
+
+        default_main = _best_default(
+            saved.get("main_label", ""),
+            ["Label Logo 1", "Logo Label", "Label Logo"]
+        )
+        default_care = _best_default(
+            saved.get("care_label", ""),
+            ["Label 1", "Care Label", "Label1"]
+        )
 
         col_c, col_d = st.columns(2)
         with col_c:
@@ -449,7 +436,8 @@ def render_comparison_tab():
     # ── File preview ──────────────────────────────────────────────────────────
     render_divider()
     render_table_meta(comp_df)
-            st.dataframe(comp_df.head(100), width='stretch', height=280)
+    st.dataframe(comp_df.head(100), use_container_width=True, height=280)
+
     # Show which styles in the Excel map to loaded BOMs
     renamed_preview = comp_df.rename(columns={style_col: "Buyer Style Number", color_col: "Color/Option"})
     if "Buyer Style Number" in renamed_preview.columns:
@@ -520,17 +508,17 @@ def render_results():
     err     = sum(v for k, v in status_counts.items() if str(k).startswith("❌"))
     render_validation_summary(ok, partial, err, len(res))
     render_table_meta(res)
-    st.dataframe(res, width='stretch', height=400)
+    st.dataframe(res, use_container_width=True, height=400)
     render_divider()
     c1, c2 = st.columns(2)
     with c1:
         st.download_button("⬇ Export Results → CSV", data=export_to_csv(res),
-                           file_name="validated_bom.csv", mime="text/csv", width='stretch')
+                           file_name="validated_bom.csv", mime="text/csv", use_container_width=True)
     with c2:
         xls = export_to_excel(result_df=res, original_df=st.session_state.get("comparison_raw", pd.DataFrame()))
         st.download_button("⬇ Export Results → Excel", data=xls, file_name="validated_bom.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           width='stretch')
+                           use_container_width=True)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

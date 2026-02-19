@@ -2,7 +2,6 @@ from typing import Optional, List, Dict
 import re
 import pandas as pd
 
-# No hardcoded colorways - all resolved dynamically from BOM PDF
 COMPONENT_ALIASES = {
     "Label 1":              ["main label", "label1", "label 1", "care label"],
     "Label Logo 1":         ["logo label", "label logo", "logo 1", "additional main label"],
@@ -15,6 +14,13 @@ COMPONENT_ALIASES = {
     "Packaging 3":          ["upc sticker", "upc bag sticker", "packaging 3"],
     "Packaging 4":          ["outer carton", "carton", "packaging 4"],
 }
+
+# Common filler words to ignore when matching colorway names
+_STOP_WORDS = {
+    "col", "color", "colour", "the", "and", "with", "of", "a", "an",
+    "black", "white", "grey", "gray",  # kept separately - these ARE color words
+}
+_NOISE_WORDS = {"col", "color", "colour", "the", "and", "with", "of", "a", "an"}
 
 
 def auto_detect_columns(df: pd.DataFrame) -> Optional[Dict[str, str]]:
@@ -43,44 +49,63 @@ def auto_detect_columns(df: pd.DataFrame) -> Optional[Dict[str, str]]:
 
 
 def _extract_numeric_prefix(value: str) -> str:
-    """Extract leading numeric portion from colorway strings like 'COL-464', '464-Black', '464 Black'."""
+    """Extract leading numeric portion: 'COL-464 COLLEGIATE NAVY' -> '464', '009-Black' -> '009'."""
     value = value.strip()
-    # Handle "COL-464 COLLEGIATE NAVY" → "464"
     m = re.match(r'^[A-Za-z]+-(\d+)', value)
     if m:
         return m.group(1)
-    # Handle "464-Black" or "464 Black" → "464"
     m = re.match(r'^(\d+)', value)
     if m:
         return m.group(1)
     return ""
 
 
-def _extract_color_words(value: str) -> List[str]:
-    """Extract significant color words, stripping prefixes like 'COL-464'."""
-    value = value.strip().lower()
-    # Remove leading prefix like "col-464" or "464-"
-    value = re.sub(r'^[a-z]+-\d+\s*', '', value)
-    value = re.sub(r'^\d+-\s*', '', value)
-    # Return remaining words
-    return [w for w in re.split(r'[\s\-_/]+', value) if len(w) > 1]
+def _color_words(value: str) -> List[str]:
+    """
+    Extract meaningful color words from a colorway string.
+    'COL-013 BLACK, BLACK' -> ['black']
+    '009-Black' -> ['black']
+    'COL-053 Graphite, Tradewinds C Sea' -> ['graphite', 'tradewinds', 'sea']
+    """
+    v = value.strip().lower()
+    # Remove leading prefix like "col-013" or "013-"
+    v = re.sub(r'^[a-z]+-\d+\s*', '', v)
+    v = re.sub(r'^\d+-\s*', '', v)
+    # Split on spaces, commas, slashes, hyphens
+    tokens = re.split(r'[\s,/\-]+', v)
+    # Filter noise and short tokens
+    return [t for t in tokens if len(t) >= 3 and t not in _NOISE_WORDS]
 
 
-def normalize_colorway(color_option_value: str, available_colorways: Optional[List[str]] = None) -> Optional[str]:
-    """Map any colorway input to the full canonical name from BOM.
-    
-    Handles formats like:
-    - 'COL-464 COLLEGIATE NAVY'  → matches '464-Collegiate Navy'
-    - '464-Black'                → matches '464-Black'
-    - 'CRUSHED BLUE'             → matches by color name
-    - '010'                      → matches '010-Black'
+def normalize_colorway(
+    color_option_value: str,
+    available_colorways: Optional[List[str]] = None
+) -> Optional[str]:
+    """
+    Map any colorway input (from Excel) to a BOM canonical colorway key.
+
+    The Excel may use a completely different numbering system (e.g. COL-013)
+    from the BOM (e.g. 009-Black). We resolve by:
+    1. Exact match
+    2. Case-insensitive exact
+    3. Numeric prefix match (same number system)
+    4. Color-word overlap score (primary fallback when numbers differ)
+    5. Substring of color name
+    6. Any shared word
     """
     if not color_option_value or not available_colorways:
         return None
+
     val = str(color_option_value).strip()
     val_lower = val.lower()
 
-    # 1. Exact match
+    # Guard: reject clearly invalid inputs
+    if val_lower in ("n/a", "nan", "none", "null", ""):
+        return None
+    if len(val.strip()) < 2:
+        return None
+
+    # 1. Exact
     if val in available_colorways:
         return val
 
@@ -89,7 +114,7 @@ def normalize_colorway(color_option_value: str, available_colorways: Optional[Li
         if cw.lower() == val_lower:
             return cw
 
-    # 3. Extract numeric prefix from input and match against BOM numeric prefixes
+    # 3. Numeric prefix match (only works if same numbering system)
     input_num = _extract_numeric_prefix(val)
     if input_num:
         for cw in available_colorways:
@@ -97,37 +122,38 @@ def normalize_colorway(color_option_value: str, available_colorways: Optional[Li
             if bom_num and input_num == bom_num:
                 return cw
 
-    # 4. Input starts with BOM prefix (e.g. "010" matches "010-Black")
-    for cw in available_colorways:
-        prefix = cw.split("-")[0].strip()
-        if val_lower.startswith(prefix.lower()):
-            return cw
-
-    # 5. Color word overlap — extract significant words and compare
-    input_words = set(_extract_color_words(val))
+    # 4. Color-word overlap scoring — most important when number systems differ
+    input_words = set(_color_words(val))
     if input_words:
-        best_match = None
-        best_score = 0
+        scored = []
         for cw in available_colorways:
-            cw_words = set(_extract_color_words(cw))
-            overlap = len(input_words & cw_words)
-            if overlap > best_score:
-                best_score = overlap
-                best_match = cw
-        if best_score >= 1 and best_match:
-            return best_match
+            cw_words = set(_color_words(cw))
+            if not cw_words:
+                continue
+            overlap = input_words & cw_words
+            # Score: number of overlapping words, normalized by BOM colorway word count
+            # to avoid matching a very generic word against a very specific colorway
+            score = len(overlap) / max(len(cw_words), 1)
+            if overlap:
+                scored.append((score, len(overlap), cw))
+        if scored:
+            scored.sort(reverse=True)
+            best_score, best_count, best_cw = scored[0]
+            # Require at least 1 overlapping word AND score > 0
+            if best_count >= 1 and best_score > 0:
+                return best_cw
 
-    # 6. Substring match on the full color name part after prefix
+    # 5. Substring match on color name part
     for cw in available_colorways:
         color_name = cw.split("-", 1)[1].lower() if "-" in cw else cw.lower()
         if val_lower in color_name or color_name in val_lower:
             return cw
 
-    # 7. Partial word match (fallback)
-    val_words = set(val_lower.split())
+    # 6. Any shared raw word (broad fallback)
+    val_raw_words = set(w for w in re.split(r'[\s,/\-]+', val_lower) if len(w) >= 3)
     for cw in available_colorways:
-        cw_words = set(cw.lower().replace("-", " ").split())
-        if val_words & cw_words:
+        cw_raw = set(w for w in re.split(r'[\s,/\-]+', cw.lower()) if len(w) >= 3)
+        if val_raw_words & cw_raw:
             return cw
 
     return None

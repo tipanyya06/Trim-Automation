@@ -6,7 +6,7 @@ import pandas as pd
 def find_supplier_by_code(costing_detail_df: pd.DataFrame, material_code: str) -> str:
     """
     Search costing detail for material_code and return supplier.
-    Handles split words, varied column names, and embedded codes in description cells.
+    Uses flexible matching: direct containment + zero-stripped variant.
     """
     if costing_detail_df is None or costing_detail_df.empty or not material_code:
         return "N/A"
@@ -15,10 +15,11 @@ def find_supplier_by_code(costing_detail_df: pd.DataFrame, material_code: str) -
     if not material_code or material_code.lower() == "n/a":
         return "N/A"
 
+    code_stripped = material_code.lstrip("0")
+
     df = costing_detail_df.copy()
     df.columns = [str(c).lower().strip() for c in df.columns]
 
-    # ── Locate supplier column ────────────────────────────────────────────────
     supplier_col = None
     for col in df.columns:
         if col == "supplier":
@@ -32,53 +33,38 @@ def find_supplier_by_code(costing_detail_df: pd.DataFrame, material_code: str) -
     if not supplier_col:
         return "N/A"
 
-    # ── Locate material/description columns to search ─────────────────────────
-    search_cols = []
-    for col in df.columns:
-        if any(kw in col for kw in ("material", "description", "desc", "code", "item", "ref")):
-            search_cols.append(col)
-    # Also search ALL columns as last resort
-    all_cols = list(df.columns)
-
-    pattern = re.compile(r'\b' + re.escape(material_code) + r'\b')
-
     def _clean_supplier(val: str) -> str:
-        """Fix split words like 'Y K K' → 'YKK', strip noise."""
         val = val.strip()
         if not val or val.lower() in ("nan", "none", ""):
             return ""
-        # Fix single-letter spaced words: "Y K K" → "YKK"
         prev = None
         while prev != val:
             prev = val
             val = re.sub(r'(?<![a-zA-Z])([A-Z]) ([A-Z])(?![a-zA-Z])', r'\1\2', val)
-        # Fix lowercase split: "bel cro" → "belcro" (only for known short splits)
-        val = re.sub(r'([a-z]) ([a-z])', lambda m: m.group(1) + m.group(2), val)
         return val.strip()
 
-    # Strategy 1: search in dedicated material/description columns
-    for col in search_cols:
-        for _, row in df.iterrows():
-            cell_val = str(row.get(col, '')).strip()
-            if cell_val == material_code or pattern.search(cell_val):
-                supplier = _clean_supplier(str(row.get(supplier_col, '')))
-                if supplier:
-                    return supplier
+    def _cell_matches(cell_str: str) -> bool:
+        s = str(cell_str).strip()
+        if not s or s.lower() in ("nan", "none", ""):
+            return False
+        if material_code in s:
+            return True
+        if code_stripped and code_stripped in s:
+            return True
+        digits = re.sub(r'[^\d]', '', s)
+        if digits == material_code or (code_stripped and digits == code_stripped):
+            return True
+        return False
 
-    # Strategy 2: scan every cell in each row for the material code
+    all_cols = list(df.columns)
     for _, row in df.iterrows():
-        found_in_row = False
         for col in all_cols:
             if col == supplier_col:
                 continue
-            cell_val = str(row.get(col, '')).strip()
-            if pattern.search(cell_val):
-                found_in_row = True
-                break
-        if found_in_row:
-            supplier = _clean_supplier(str(row.get(supplier_col, '')))
-            if supplier:
-                return supplier
+            if _cell_matches(str(row.get(col, ''))):
+                supplier = _clean_supplier(str(row.get(supplier_col, '')))
+                if supplier:
+                    return supplier
 
     return "N/A"
 
@@ -100,7 +86,7 @@ def extract_supplier_lookup(costing_detail_df: pd.DataFrame) -> Dict[str, dict]:
         material = str(row.get(mat_col, '')).strip() if mat_col else ''
 
         if not material and desc_col:
-            m = re.search(r'\b(\d{3,6})\b', str(row.get(desc_col, '')))
+            m = re.search(r'(?<!\d)(\d{3,7})(?!\d)', str(row.get(desc_col, '')))
             material = m.group(1) if m else ''
 
         if not material:
@@ -115,5 +101,9 @@ def extract_supplier_lookup(costing_detail_df: pd.DataFrame) -> Dict[str, dict]:
             "country_of_origin": str(row.get(coo_col,  '')).strip() if coo_col  else '',
             "description":       str(row.get(desc_col, '')).strip() if desc_col else '',
         }
+        # Also register zero-stripped variant
+        stripped = material.lstrip("0")
+        if stripped and stripped != material:
+            out[stripped] = out[material]
 
     return out
