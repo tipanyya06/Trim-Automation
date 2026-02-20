@@ -22,7 +22,25 @@ st.markdown("""
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   html, body, [class*="css"] { font-family:'Inter',sans-serif; background:#0f1117; color:#e8e8e8; font-size:14px; -webkit-font-smoothing:antialiased; }
-  #MainMenu, footer, header { visibility:hidden; }
+  /* Hide menu and footer but NOT the header — the sidebar toggle lives inside it */
+  #MainMenu, footer { visibility:hidden; }
+  header[data-testid="stHeader"] { background:#0f1117 !important; border-bottom:none !important; }
+  /* Style the sidebar toggle button so it's always clearly visible */
+  button[data-testid="collapsedControl"] {
+    visibility:visible !important; opacity:1 !important;
+    background:#13151e !important; border:1px solid #2a2d3e !important;
+    border-radius:8px !important; color:#e8e8e8 !important;
+  }
+  button[data-testid="collapsedControl"]:hover {
+    border-color:#3b82f6 !important; color:#3b82f6 !important;
+  }
+  /* Also make the in-sidebar collapse arrow visible */
+  button[data-testid="baseButton-header"] {
+    color:#9ca3af !important;
+  }
+  button[data-testid="baseButton-header"]:hover {
+    color:#3b82f6 !important;
+  }
   .block-container { padding:2rem 2.5rem !important; max-width:100% !important; }
   section[data-testid="stSidebar"] { background:#13151e; border-right:1px solid #1e2130; }
   section[data-testid="stSidebar"] .block-container { padding:1.5rem 1.2rem !important; }
@@ -41,8 +59,19 @@ st.markdown("""
   [data-testid="stSelectbox"] > div > div { background:#13151e !important; border:1px solid #2a2d3e !important; border-radius:8px !important; color:#e8e8e8 !important; font-size:0.85rem !important; }
   [data-testid="stExpander"] { border:1px solid #1e2130 !important; border-radius:8px !important; background:#13151e !important; }
   button[data-baseweb="tab"] { font-size:0.8rem !important; font-weight:500 !important; letter-spacing:0.04em !important; text-transform:uppercase !important; }
+  .page-pill {
+    display:inline-flex; align-items:center; justify-content:center;
+    width:32px; height:32px; border-radius:8px; font-size:0.78rem; font-weight:600;
+    border:1px solid #2a2d3e; background:#13151e; color:#9ca3af; cursor:pointer;
+  }
+  .page-pill-active {
+    background:#1e3a5f !important; border-color:#3b82f6 !important; color:#3b82f6 !important;
+  }
 </style>
 """, unsafe_allow_html=True)
+
+BOMS_PER_PAGE       = 5   # PDF tab: BOMs shown per page
+STYLES_PER_PAGE     = 5   # Label mapping: styles shown per page
 
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
@@ -94,6 +123,43 @@ def render_validation_summary(ok, partial, err, total):
     </div>""", unsafe_allow_html=True)
 
 
+def render_pagination(page_key: str, current_page: int, total_pages: int, key_suffix: str = ""):
+    """Render prev / page-number pills / next controls. Use key_suffix to avoid duplicate keys."""
+    if total_pages <= 1:
+        return current_page
+
+    suffix = key_suffix or page_key
+    col_prev, col_pills, col_next = st.columns([1, 6, 1])
+
+    with col_prev:
+        if st.button("← Prev", key=f"{suffix}_prev", disabled=current_page == 0):
+            st.session_state[page_key] = current_page - 1
+            st.rerun()
+
+    with col_pills:
+        window = 3
+        start = max(0, current_page - window)
+        end   = min(total_pages, current_page + window + 1)
+        pills_html = "<div style='display:flex;gap:6px;justify-content:center;align-items:center;'>"
+        for p in range(start, end):
+            active = "page-pill-active" if p == current_page else ""
+            pills_html += f"<div class='page-pill {active}'>{p + 1}</div>"
+        pills_html += "</div>"
+        st.markdown(pills_html, unsafe_allow_html=True)
+
+    with col_next:
+        if st.button("Next →", key=f"{suffix}_next", disabled=current_page >= total_pages - 1):
+            st.session_state[page_key] = current_page + 1
+            st.rerun()
+
+    st.markdown(
+        f"<div style='text-align:center;font-size:0.7rem;color:#5a6080;margin-top:4px;'>"
+        f"Page {current_page + 1} of {total_pages}</div>",
+        unsafe_allow_html=True,
+    )
+    return st.session_state.get(page_key, current_page)
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 def render_sidebar():
@@ -135,9 +201,10 @@ def render_sidebar():
             """)
 
         render_divider()
-        if st.button("🗑 Clear All Data", use_container_width=True):
+        if st.button("🗑 Clear All Data", width='stretch'):
             for k in ["bom_dict", "comparison_raw", "validation_result",
-                      "label_selections"]:
+                      "label_selections", "pdf_bytes_store", "pdf_hashes",
+                      "pdf_tab_page", "label_map_page"]:
                 st.session_state.pop(k, None)
             st.rerun()
 
@@ -159,60 +226,143 @@ def render_pdf_tab():
         render_info_banner("Upload one or more Columbia BOM PDFs. Each PDF's style is auto-detected and used to match rows in your Excel.")
         return
 
-    # Parse and store all PDFs
-    bom_dict = st.session_state.get("bom_dict", {})
-    newly_parsed = []
-    with st.spinner(f"Parsing {len(uploaded_pdfs)} PDF(s)..."):
-        for pdf_file in uploaded_pdfs:
-            try:
-                bom_data = parse_bom_pdf(pdf_file)
-                style = bom_data.get("metadata", {}).get("style") or pdf_file.name
-                bom_dict[style] = bom_data
-                newly_parsed.append(style)
-            except Exception as e:
-                st.error(f"Failed to parse {pdf_file.name}: {e}")
-    st.session_state["bom_dict"] = bom_dict
+    # ── Parse & cache ──────────────────────────────────────────────────────────
+    bom_dict         = st.session_state.get("bom_dict", {})
+    pdf_bytes_store  = st.session_state.get("pdf_bytes_store", {})
+    pdf_hashes       = st.session_state.get("pdf_hashes", {})
+
+    import hashlib, io as _io
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    pdf_data_list = [(f.name, f.read()) for f in uploaded_pdfs]
+    to_parse = []
+    for fname, raw_bytes in pdf_data_list:
+        fhash = hashlib.md5(raw_bytes).hexdigest()
+        if pdf_hashes.get(fname) != fhash:
+            to_parse.append((fname, raw_bytes, fhash))
+
+    newly_parsed, errors = [], []
+
+    if to_parse:
+        def _parse_one(args):
+            fname, raw_bytes, fhash = args
+            bom_data = parse_bom_pdf(_io.BytesIO(raw_bytes))
+            style = bom_data.get("metadata", {}).get("style") or fname
+            return style, bom_data, raw_bytes, fhash, fname
+
+        total        = len(to_parse)
+        cached_count = len(uploaded_pdfs) - total
+
+        st.markdown(f"""
+        <div style="background:#13151e;border:1px solid #1e2130;border-radius:12px;padding:1.2rem 1.5rem;margin-bottom:1rem;">
+          <div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.1em;color:#5a6080;margin-bottom:0.5rem;">Parsing BOMs</div>
+          <div style="font-size:1rem;font-weight:600;color:#fff;margin-bottom:0.25rem;">
+            {total} PDF(s) to parse{"  ·  " + str(cached_count) + " cached" if cached_count else ""}
+          </div>
+          <div style="font-size:0.78rem;color:#9ca3af;">Processing in parallel — please wait...</div>
+        </div>""", unsafe_allow_html=True)
+
+        progress_bar = st.progress(0, text="Starting...")
+        status_text  = st.empty()
+        done_count   = 0
+
+        with ThreadPoolExecutor(max_workers=min(8, total)) as executor:
+            futures = {executor.submit(_parse_one, args): args[0] for args in to_parse}
+            for future in as_completed(futures):
+                try:
+                    style, bom_data, raw_bytes, fhash, fname = future.result()
+                    bom_dict[style]        = bom_data
+                    pdf_bytes_store[style] = raw_bytes
+                    pdf_hashes[fname]      = fhash
+                    newly_parsed.append(style)
+                except Exception as e:
+                    errors.append(f"Failed: {futures[future]}: {e}")
+                done_count += 1
+                progress_bar.progress(done_count / total, text=f"Parsed {done_count} / {total}")
+                status_text.markdown(
+                    f"<div style='font-size:0.78rem;color:#9ca3af;margin-top:0.25rem;'>"
+                    f"✓ {', '.join(newly_parsed[-3:])}"
+                    f"{'...' if len(newly_parsed) > 3 else ''}</div>",
+                    unsafe_allow_html=True
+                )
+
+        progress_bar.progress(1.0, text=f"✅ Done — {len(newly_parsed)} BOM(s) parsed")
+        status_text.empty()
+        for err in errors:
+            st.error(err)
+    else:
+        st.markdown(f"""
+        <div style="background:#0d2218;border:1px solid #1a4a30;border-radius:10px;
+             padding:0.85rem 1.1rem;font-size:0.82rem;color:#34d399;margin-bottom:1rem;">
+          ⚡ All {len(uploaded_pdfs)} PDF(s) already parsed — loaded from cache instantly.
+        </div>""", unsafe_allow_html=True)
+
+    st.session_state["bom_dict"]        = bom_dict
+    st.session_state["pdf_bytes_store"] = pdf_bytes_store
+    st.session_state["pdf_hashes"]      = pdf_hashes
 
     if not bom_dict:
         return
 
-    render_info_banner(f"Loaded {len(bom_dict)} BOM(s): {', '.join(bom_dict.keys())}")
+    # ── Clear all PDFs button ──────────────────────────────────────────────────
+    render_divider()
+    col_info, col_clear = st.columns([5, 1])
+    with col_info:
+        render_info_banner(f"Loaded {len(bom_dict)} BOM(s): {', '.join(bom_dict.keys())}")
+    with col_clear:
+        if st.button("🗑 Clear All PDFs", key="clear_pdfs_btn"):
+            for k in ["bom_dict", "pdf_bytes_store", "pdf_hashes",
+                      "pdf_tab_page", "validation_result", "label_selections"]:
+                st.session_state.pop(k, None)
+            st.rerun()
 
-    # ── Summary table of all loaded BOMs ─────────────────────────────────────
+    # ── BOM summary table (no pagination — just show all) ─────────────────────
     render_divider()
     st.markdown("""<div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.1em;
                 color:#5a6080;margin-bottom:0.75rem;">Loaded BOMs</div>""", unsafe_allow_html=True)
 
+    all_styles   = list(bom_dict.keys())
+
     summary_rows = []
-    for style, bom in bom_dict.items():
+    for style in all_styles:
+        bom  = bom_dict[style]
         meta = bom.get("metadata", {})
-        sections_with_data = [k for k, v in bom.items()
-                               if k not in ("metadata", "supplier_lookup") and isinstance(v, pd.DataFrame) and not v.empty]
+        sections_with_data = [
+            k for k, v in bom.items()
+            if k not in ("metadata", "supplier_lookup")
+            and isinstance(v, pd.DataFrame) and not v.empty
+        ]
         summary_rows.append({
-            "Style":        style,
-            "Season":       meta.get("season", "—"),
-            "Design":       meta.get("design", "—"),
-            "LO":           meta.get("production_lo", "—"),
-            "Sections":     len(sections_with_data),
-            "Colorways":    len(bom.get("color_bom", pd.DataFrame()).columns) if not bom.get("color_bom", pd.DataFrame()).empty else 0,
+            "Style":     style,
+            "Season":    meta.get("season", "—"),
+            "Design":    meta.get("design", "—"),
+            "LO":        meta.get("production_lo", "—"),
+            "Sections":  len(sections_with_data),
+            "Colorways": len(bom.get("color_bom", pd.DataFrame()).columns)
+                         if not bom.get("color_bom", pd.DataFrame()).empty else 0,
         })
-    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, height=min(80 + 35 * len(summary_rows), 300))
+
+    st.dataframe(pd.DataFrame(summary_rows), width='stretch',
+                 height=min(80 + 35 * len(summary_rows), 400))
 
     # ── Inspect individual BOM ────────────────────────────────────────────────
     render_divider()
-    selected_style = st.selectbox("Inspect BOM for style", options=list(bom_dict.keys()))
+    selected_style = st.selectbox("Inspect BOM for style", options=all_styles)
     bom_data = bom_dict[selected_style]
-    meta = bom_data.get("metadata", {})
+    meta     = bom_data.get("metadata", {})
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Style",  meta.get("style", "—"))
-    c2.metric("Season", meta.get("season", "—"))
-    c3.metric("Design", meta.get("design", "—"))
+    c1.metric("Style",         meta.get("style", "—"))
+    c2.metric("Season",        meta.get("season", "—"))
+    c3.metric("Design",        meta.get("design", "—"))
     c4.metric("Production LO", meta.get("production_lo", "—"))
 
     render_divider()
-    section_keys = [k for k, v in bom_data.items()
-                    if k not in ("metadata", "supplier_lookup") and isinstance(v, pd.DataFrame) and not v.empty]
+    section_keys = [
+        k for k, v in bom_data.items()
+        if k not in ("metadata", "supplier_lookup")
+        and isinstance(v, pd.DataFrame) and not v.empty
+    ]
     if not section_keys:
         render_warn_banner("No sections were extracted from this PDF.")
         return
@@ -231,13 +381,13 @@ def render_pdf_tab():
         )]
 
     render_table_meta(view_df)
-    st.dataframe(view_df, use_container_width=True, height=380)
+    st.dataframe(view_df, width='stretch', height=380)
 
     render_divider()
     c1, c2 = st.columns(2)
     with c1:
         st.download_button("⬇ Export Section → CSV", data=export_to_csv(view_df),
-                           file_name=f"{selected_style}_{section}.csv", mime="text/csv", use_container_width=True)
+                           file_name=f"{selected_style}_{section}.csv", mime="text/csv", width='stretch')
     with c2:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
@@ -246,15 +396,30 @@ def render_pdf_tab():
         st.download_button("⬇ Export All Sections → Excel", data=buf.getvalue(),
                            file_name=f"{selected_style}_sections.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
-
-
+                           width='stretch')
 
 
 # ── Helpers for label component extraction ───────────────────────────────────
 
 def _get_components_for_bom(bom_data: dict) -> list:
-    """Return list of component names from the color_specification of a BOM."""
+    from parsers.color_bom import extract_color_bom_lookup
+    cb = bom_data.get("color_bom")
+    if cb is not None and not cb.empty:
+        lookup = extract_color_bom_lookup(cb)
+        comps  = lookup.get("components", {})
+        if comps:
+            result = []
+            for name, info in comps.items():
+                code = str(info.get("material_code", "")).strip()
+                if not code:
+                    import re
+                    desc = str(info.get("description", ""))
+                    m    = re.search(r'(?<!\d)(\d{3,6})(?!\d)', desc)
+                    code = m.group(1) if m else ""
+                label = f"{name} - {code}" if code else name
+                result.append(label)
+            return result
+
     cs = bom_data.get("color_specification")
     if cs is None or cs.empty:
         return []
@@ -266,14 +431,25 @@ def _get_components_for_bom(bom_data: dict) -> list:
     ]
 
 
-def _get_label_preview(bom_data: dict, comp_name: str, matched_cw: str = None) -> str:
-    """Return a short color preview string for a component + colorway."""
+def _filter_label_components(components: list) -> list:
+    """
+    Remove 'Label Logo 1' entries from the dropdown list.
+    Keeps everything else (Label 1, Care Label, Hangtag, etc.)
+    """
+    return [
+        c for c in components
+        if "label logo 1" not in c.lower()
+    ]
+
+
+def _get_label_preview(bom_data: dict, comp_name: str) -> str:
     cs = bom_data.get("color_specification")
     if cs is None or cs.empty or not comp_name:
         return ""
-    comp_col = cs.columns[0]
+    comp_col      = cs.columns[0]
     colorway_cols = [c for c in cs.columns[1:] if c and not c.startswith("col_")]
-    row_match = cs[cs[comp_col] == comp_name]
+    lookup_name   = comp_name.split(" - ")[0].strip() if " - " in comp_name else comp_name
+    row_match     = cs[cs[comp_col] == lookup_name]
     if row_match.empty:
         return ""
     sample = {}
@@ -287,9 +463,20 @@ def _get_label_preview(bom_data: dict, comp_name: str, matched_cw: str = None) -
 # ── Comparison Tab ────────────────────────────────────────────────────────────
 
 def _read_comparison_file(file) -> pd.DataFrame:
-    raw = pd.read_excel(file, header=None) if file.name.lower().endswith((".xlsx", ".xls")) else pd.read_csv(file, header=None)
+    is_excel = file.name.lower().endswith((".xlsx", ".xls"))
+    try:
+        df   = pd.read_excel(file, header=0) if is_excel else pd.read_csv(file, header=0)
+        cols = [str(c).strip() for c in df.columns]
+        meaningful = sum(1 for c in cols if c and not c.startswith("Unnamed") and c.lower() not in ("nan","none"))
+        if meaningful >= max(1, len(cols) * 0.4):
+            df.columns = cols
+            return df[~df.isnull().all(axis=1)].reset_index(drop=True)
+    except Exception:
+        pass
+    file.seek(0) if hasattr(file, "seek") else None
+    raw = pd.read_excel(file, header=None, nrows=None) if is_excel else pd.read_csv(file, header=None)
     header_row_idx = 0
-    for i, row in raw.iterrows():
+    for i, row in raw.head(10).iterrows():
         non_empty = sum(1 for v in row if str(v).strip() not in ("", "nan", "None"))
         if non_empty >= max(1, len(raw.columns) * 0.5):
             header_row_idx = i
@@ -354,24 +541,47 @@ def render_comparison_tab():
             index=list(comp_df.columns).index(default_color) if default_color in comp_df.columns else 0
         )
 
-    # ── Per-BOM label mapping ─────────────────────────────────────────────────
+    # ── Per-BOM label mapping — paginated ────────────────────────────────────
     render_divider()
     st.markdown("""<div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:0.1em;
                 color:#5a6080;margin-bottom:0.75rem;">Label Mapping — Per Buyer Style</div>""",
                 unsafe_allow_html=True)
     render_info_banner(
-        "Each loaded BOM has its own label component options. "
-        "Select the correct Main Label and Care Label component for each style below."
+        "Select the correct Main Label and Care Label for each style. "
+        "'Label Logo 1' entries are excluded from dropdowns automatically."
     )
 
     label_selections = st.session_state.get("label_selections", {})
+    all_style_keys   = list(bom_dict.keys())
+    total_styles     = len(all_style_keys)
+    total_lm_pages   = max(1, -(-total_styles // STYLES_PER_PAGE))
+    lm_page          = st.session_state.get("label_map_page", 0)
+    lm_page          = max(0, min(lm_page, total_lm_pages - 1))
+    st.session_state["label_map_page"] = lm_page
 
-    for style_key, bom_data in bom_dict.items():
-        components = _get_components_for_bom(bom_data)
+    # Show page counter
+    st.markdown(
+        f"<div style='font-size:0.72rem;color:#5a6080;margin-bottom:0.75rem;'>"
+        f"Showing styles {lm_page * STYLES_PER_PAGE + 1}–"
+        f"{min((lm_page + 1) * STYLES_PER_PAGE, total_styles)} of {total_styles}</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Pagination controls TOP ────────────────────────────────────────────────
+    render_pagination("label_map_page", lm_page, total_lm_pages, key_suffix="lm_top")
+
+    # ── Only render the current page slice ────────────────────────────────────
+    page_style_keys = all_style_keys[lm_page * STYLES_PER_PAGE : (lm_page + 1) * STYLES_PER_PAGE]
+
+    for style_key in page_style_keys:
+        bom_data   = bom_dict[style_key]
+        all_comps  = _get_components_for_bom(bom_data)
+        components = _filter_label_components(all_comps)
+
         if not components:
             st.markdown(
                 f"""<div style="font-size:0.8rem;color:#f59e0b;padding:6px 0;">
-                ⚠ Style <b>{style_key}</b> — no color specification components found.</div>""",
+                ⚠ Style <b>{style_key}</b> — no label components found.</div>""",
                 unsafe_allow_html=True
             )
             continue
@@ -385,60 +595,44 @@ def render_comparison_tab():
 
         saved = label_selections.get(style_key, {})
 
-        # Smart defaults: "Label Logo 1" for Main Label, "Label 1" for Care Label
-        # Priority: 1) previously saved user selection  2) preferred name match  3) first item
-        def _best_default(saved_val, preferred_names):
-            if saved_val and saved_val in components:
+        def _best_default(saved_val, preferred_names, _comps=components):
+            if saved_val and saved_val in _comps:
                 return saved_val
             for preferred in preferred_names:
-                for comp in components:
+                for comp in _comps:
                     if preferred.lower() in comp.lower():
                         return comp
-            return components[0]
+            return _comps[0]
 
-        default_main = _best_default(
-            saved.get("main_label", ""),
-            ["Label Logo 1", "Logo Label", "Label Logo"]
-        )
-        default_care = _best_default(
-            saved.get("care_label", ""),
-            ["Label 1", "Care Label", "Label1"]
-        )
+        default_main = _best_default(saved.get("main_label", ""), ["Logo Label", "Main Label"])
+        default_care = _best_default(saved.get("care_label", ""), ["Label 1", "Care Label", "Label1"])
 
         col_c, col_d = st.columns(2)
         with col_c:
             main_sel = st.selectbox(
-                f"Main Label — {style_key}",
-                options=components,
+                f"Main Label — {style_key}", options=components,
                 index=components.index(default_main) if default_main in components else 0,
                 key=f"main_label_{style_key}"
             )
         with col_d:
             care_sel = st.selectbox(
-                f"Care Label — {style_key}",
-                options=components,
+                f"Care Label — {style_key}", options=components,
                 index=components.index(default_care) if default_care in components else 0,
                 key=f"care_label_{style_key}"
             )
-
-        # Show color preview for selected components
-        main_preview = _get_label_preview(bom_data, main_sel)
-        care_preview = _get_label_preview(bom_data, care_sel)
-        if main_preview:
-            render_info_banner(f"Main Label colors → {main_preview}")
-        if care_preview and care_sel != main_sel:
-            render_info_banner(f"Care Label colors → {care_preview}")
 
         label_selections[style_key] = {"main_label": main_sel, "care_label": care_sel}
 
     st.session_state["label_selections"] = label_selections
 
+    # ── Pagination controls BOTTOM ─────────────────────────────────────────────
+    render_pagination("label_map_page", lm_page, total_lm_pages, key_suffix="lm_bottom")
+
     # ── File preview ──────────────────────────────────────────────────────────
     render_divider()
     render_table_meta(comp_df)
-    st.dataframe(comp_df.head(100), use_container_width=True, height=280)
+    st.dataframe(comp_df.head(100), width='stretch', height=280)
 
-    # Show which styles in the Excel map to loaded BOMs
     renamed_preview = comp_df.rename(columns={style_col: "Buyer Style Number", color_col: "Color/Option"})
     if "Buyer Style Number" in renamed_preview.columns:
         excel_styles = renamed_preview["Buyer Style Number"].astype(str).str.strip().str.upper().unique()
@@ -457,14 +651,14 @@ def render_comparison_tab():
 
             result_parts = []
             for style_val, group_df in renamed_df.groupby("Buyer Style Number", sort=False):
-                style_str = str(style_val).strip().upper()
-                matched_bom = None
+                style_str    = str(style_val).strip().upper()
+                matched_bom  = None
                 matched_bom_key = None
 
                 for bom_style, bom in bom_dict.items():
                     bs = str(bom_style).strip().upper()
                     if style_str == bs or style_str in bs or bs in style_str:
-                        matched_bom = bom
+                        matched_bom     = bom
                         matched_bom_key = bom_style
                         break
 
@@ -477,9 +671,8 @@ def render_comparison_tab():
                     result_parts.append(group_df)
                     continue
 
-                # Attach per-style label selections
                 per_style_labels = label_sels.get(matched_bom_key, {})
-                bom_with_labels = dict(matched_bom)
+                bom_with_labels  = dict(matched_bom)
                 bom_with_labels["selected_main_label_comp"] = per_style_labels.get("main_label")
                 bom_with_labels["selected_care_label_comp"] = per_style_labels.get("care_label")
 
@@ -508,17 +701,17 @@ def render_results():
     err     = sum(v for k, v in status_counts.items() if str(k).startswith("❌"))
     render_validation_summary(ok, partial, err, len(res))
     render_table_meta(res)
-    st.dataframe(res, use_container_width=True, height=400)
+    st.dataframe(res, width='stretch', height=400)
     render_divider()
     c1, c2 = st.columns(2)
     with c1:
         st.download_button("⬇ Export Results → CSV", data=export_to_csv(res),
-                           file_name="validated_bom.csv", mime="text/csv", use_container_width=True)
+                           file_name="validated_bom.csv", mime="text/csv", width='stretch')
     with c2:
         xls = export_to_excel(result_df=res, original_df=st.session_state.get("comparison_raw", pd.DataFrame()))
         st.download_button("⬇ Export Results → Excel", data=xls, file_name="validated_bom.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True)
+                           width='stretch')
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

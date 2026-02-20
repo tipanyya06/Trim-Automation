@@ -48,12 +48,9 @@ def _rows_to_df(rows: list) -> pd.DataFrame:
 
 def _detect_section(page_text: str) -> str:
     txt = page_text.lower()
-    # Only look at the first 5 lines for section title detection
-    # This avoids false positives from cell content like "Costing BOM Line Slot"
     first_lines = "\n".join(page_text.lower().splitlines()[:5])
     first_lines_nsp = re.sub(r'\s+', '', first_lines)
 
-    # Check full text for clearly named sections
     if "color bom" in txt:
         return "color_bom"
     if "colorless bom" in txt:
@@ -61,8 +58,6 @@ def _detect_section(page_text: str) -> str:
     if "color specification" in txt:
         return "color_specification"
 
-    # Costing: ONLY check the first few lines for the section title
-    # to avoid false positives from cell text like "Costing BOM Line Slot"
     _costing_keywords = [
         "costing detail", "costing bom", "cost detail", "cost bom",
         "costing summary", "costingdetail", "costingbom",
@@ -117,7 +112,6 @@ def _extract_metadata(first_page_text: str) -> Dict[str, Any]:
 
 
 def _is_costing_detail_table(table: list) -> bool:
-    """Return True if table looks like a costing detail (has Material + Supplier headers)."""
     for row in table[:5]:
         if row is None:
             continue
@@ -133,24 +127,18 @@ def _is_costing_detail_table(table: list) -> bool:
 
 
 def _fix_split_text(s: str) -> str:
-    """Fix OCR split words. Only merges single uppercase letters (Y K K -> YKK)
-    and clearly broken mid-word splits. Does NOT merge normal words."""
     if not s:
         return s
-    # Fix "Y K K" → "YKK" (single capital letters separated by spaces)
     prev = None
     while prev != s:
         prev = s
         s = re.sub(r'(?<![a-zA-Z])([A-Z]) ([A-Z])(?![a-zA-Z])', r'\1\2', s)
-    # Fix mid-word splits like "Internatio nal" → "International"
-    # Only merge when the second part starts lowercase and is clearly a suffix
     s = re.sub(r'([a-zA-Z]{4,})  ?([a-z]{2,5})(?=\s|$)',
                lambda m: m.group(1) + m.group(2) if len(m.group(2)) <= 4 else m.group(0), s)
     return s.strip()
 
 
 def _extract_codes_from_cell(cell_str: str) -> set:
-    """Extract all plausible 3-7 digit material codes from a cell string."""
     codes = set()
     s = str(cell_str).strip()
     if not s or s.lower() in ("nan", "none", ""):
@@ -169,7 +157,6 @@ def _extract_codes_from_cell(cell_str: str) -> set:
 
 
 def _build_supplier_lookup(costing_detail_df: pd.DataFrame) -> Dict[str, str]:
-    """Build {material_code: supplier_name} from costing detail, registering zero-stripped variants."""
     if costing_detail_df is None or costing_detail_df.empty:
         return {}
 
@@ -237,6 +224,128 @@ def _build_supplier_lookup(costing_detail_df: pd.DataFrame) -> Dict[str, str]:
     return lookup
 
 
+# ── Content Report Parser ─────────────────────────────────────────────────────
+
+def _parse_content_report_tables(tables: list) -> pd.DataFrame:
+    """
+    Dedicated parser for the Content Report table structure.
+
+    PDF layout (pdfplumber extracts it as one merged table):
+        Row A:  [CONTENT CODE: HUG Shell:...]  [Color Way Number]  [Color Way Name]
+        Row B:  [FRENCH | translation]          [023]               [City Grey]
+        Row C:  [GERMAN | translation]          [810]               [Hot Coral...]
+        Row D:  []                              [433]               [Mountain Blue...]
+        ...
+
+    Output — one row per colorway:
+        Color Way Number | Color Way Name | Content Code | Content Full
+        023              | City Grey      | HUG          | CONTENT CODE: HUG Shell:...
+        810              | Hot Coral...   | HUG          | ...
+    """
+    all_rows = []
+    for tbl in tables:
+        for row in tbl:
+            if row is None:
+                continue
+            cleaned = [(str(c).replace("\n", " ").strip() if c is not None else "") for c in row]
+            if any(cleaned):
+                all_rows.append(cleaned)
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    # ── Step 1: Identify colorway number + name column indices ──────────────────
+    cw_num_col_idx = None
+    cw_name_col_idx = None
+
+    # First pass: look for explicit header text "Color Way Number" / "Color Way Name"
+    for row in all_rows[:10]:
+        for i, cell in enumerate(row):
+            cl = cell.lower()
+            if "color way number" in cl or "colorway number" in cl:
+                cw_num_col_idx = i
+            if "color way name" in cl or "colorway name" in cl:
+                cw_name_col_idx = i
+
+    # Fallback: rightmost columns — find the one that most often holds 3-digit numbers
+    if cw_num_col_idx is None and all_rows:
+        num_cols = max(len(r) for r in all_rows)
+        for candidate in range(num_cols - 1, -1, -1):
+            hits = sum(
+                1 for r in all_rows
+                if len(r) > candidate and re.match(r'^\d{3}$', r[candidate].strip())
+            )
+            if hits >= 2:          # need at least 2 rows with a 3-digit value
+                cw_num_col_idx = candidate
+                # Name column is immediately to the right (if it exists)
+                if candidate + 1 < num_cols:
+                    cw_name_col_idx = candidate + 1
+                break
+
+    # ── Step 2: Collect all (cw_num, cw_name) pairs and the content code ────────
+    current_content_code = ""
+    current_content_full = ""
+
+    # colorway dict: {cw_num: cw_name}  — preserves first-seen order
+    colorway_map: dict = {}
+
+    # Skip rows that are page-level noise (not actual table data)
+    _skip_patterns = [
+        r'content report line slot',
+        r'color way number',
+        r'color way name',
+        r'colorway number',
+        r'colorway name',
+    ]
+
+    for row in all_rows:
+        row_text = " ".join(row).lower()
+
+        # Skip page header / label rows
+        if any(re.search(p, row_text) for p in _skip_patterns):
+            # But still grab the colorway data that may sit in the same row
+            pass  # fall through to colorway extraction below
+
+        # Detect CONTENT CODE in any cell
+        for cell in row:
+            if "CONTENT CODE" in cell.upper():
+                m = re.search(r'CONTENT CODE[:\s]+(\w+)', cell, re.IGNORECASE)
+                if m:
+                    current_content_code = m.group(1).strip()
+                    current_content_full = cell.strip()
+                break
+
+        # Extract colorway number + name from their dedicated columns
+        cw_num = ""
+        cw_name = ""
+        if cw_num_col_idx is not None and len(row) > cw_num_col_idx:
+            cw_num = row[cw_num_col_idx].strip()
+        if cw_name_col_idx is not None and len(row) > cw_name_col_idx:
+            cw_name = row[cw_name_col_idx].strip()
+
+        # Only store rows where cw_num is a real 3-digit colorway number
+        if re.match(r'^\d{3}$', cw_num) and cw_num not in colorway_map:
+            colorway_map[cw_num] = cw_name
+
+    if not colorway_map or not current_content_code:
+        return pd.DataFrame()
+
+    # ── Step 3: Build clean output — one row per colorway ───────────────────────
+    output_rows = [
+        {
+            "Color Way Number": cw_num,
+            "Color Way Name":   cw_name,
+            "Content Code":     current_content_code,
+            "Content Full":     current_content_full,
+        }
+        for cw_num, cw_name in colorway_map.items()
+    ]
+
+    return pd.DataFrame(output_rows)
+
+
+# ── Main Parser ───────────────────────────────────────────────────────────────
+
 def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
     result: Dict[str, Any] = {"metadata": {}}
 
@@ -268,7 +377,6 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
                     continue
 
                 if section == "costing_detail" and _is_costing_detail_table(tbl):
-                    # Real costing table — extract header + rows
                     header_idx = 0
                     for ri, row in enumerate(tbl[:5]):
                         if row is None:
@@ -289,7 +397,6 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
                         costing_detail_rows.append(cleaned)
 
                 elif section == "costing_detail" and costing_detail_header:
-                    # Continuation page — skip repeated header if present
                     tbl_data = tbl
                     if _is_costing_detail_table(tbl):
                         start_idx = 1
@@ -317,14 +424,13 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
                         costing_detail_rows.append(cleaned)
 
                 elif section == "costing_detail":
-                    # Page is classified as costing but table has no Material/Supplier headers
-                    # — it's a non-data table on a costing page (e.g. colorway list in page header).
-                    # Do NOT store it anywhere — skip it entirely.
                     pass
 
                 else:
+                    # Content report pages go into a dedicated bucket for special parsing
                     tables_by_section.setdefault(section, []).append(tbl)
 
+        # ── Build costing_detail DataFrame ─────────────────────────────────────
         if costing_detail_header and costing_detail_rows:
             header, seen = [], {}
             for c in costing_detail_header:
@@ -340,7 +446,14 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
         else:
             result["costing_detail"] = pd.DataFrame()
 
+        # ── Build all other section DataFrames ──────────────────────────────────
         for section, tables in tables_by_section.items():
+
+            # ── Special handling: content_report ───────────────────────────────
+            if section == "content_report":
+                result["content_report"] = _parse_content_report_tables(tables)
+                continue
+
             all_rows, expected_cols = [], None
             for t in tables:
                 for row in t:

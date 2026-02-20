@@ -73,9 +73,14 @@ def extract_content_codes(content_report_df: pd.DataFrame) -> Dict[str, dict]:
     return result
 
 
-def extract_care_codes(care_report_df: pd.DataFrame) -> Dict[str, dict]:
+def extract_care_codes(care_report_df: pd.DataFrame, content_report_df: pd.DataFrame = None) -> Dict[str, dict]:
+    # If care_report is missing/empty, fall back to content_report
     if care_report_df is None or care_report_df.empty:
-        return {}
+        if content_report_df is not None and not content_report_df.empty:
+            care_report_df = content_report_df
+        else:
+            return {}
+
     df = care_report_df.copy()
     cols = {str(c).lower(): c for c in df.columns}
     num_col  = cols.get('color way number') or cols.get('colorway number') or None
