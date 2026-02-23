@@ -283,14 +283,10 @@ def validate_and_fill(comparison_df: pd.DataFrame, bom_data: Dict[str, Any]) -> 
         care_color = get_color_from_spec(care_comp, matched_cw, color_raw)
 
         # ── Write: Main Label ──────────────────────────────────────────────
-        if raw_main:
-            result.at[idx, "Main Label"]          = main_id or main_code or "N/A"
-            result.at[idx, "Main Label Color"]    = main_color or "N/A"
-            result.at[idx, "Main Label Supplier"] = resolve_supplier(main_code)
-        else:
-            result.at[idx, "Main Label"]          = "N/A"
-            result.at[idx, "Main Label Color"]    = "N/A"
-            result.at[idx, "Main Label Supplier"] = "N/A"
+
+        result.at[idx, "Main Label"]          = main_id or main_code or "N/A"
+        result.at[idx, "Main Label Color"]    = main_color or "N/A"
+        result.at[idx, "Main Label Supplier"] = resolve_supplier(main_code)
 
         # ── Write: Additional Main Label ───────────────────────────────────
         logo_code  = get_code("Label Logo 1")
@@ -299,15 +295,9 @@ def validate_and_fill(comparison_df: pd.DataFrame, bom_data: Dict[str, Any]) -> 
         result.at[idx, "Additional Main Label Color"] = logo_color or "N/A"
 
         # ── Write: Care Label ──────────────────────────────────────────────
-        if raw_care:
-            result.at[idx, "Care Label"]          = care_id or care_code_mat or "N/A"
-            result.at[idx, "Care Label Color"]    = care_color or "N/A"
-            result.at[idx, "Care Label Supplier"] = resolve_supplier(care_code_mat)
-        else:
-            result.at[idx, "Care Label"]          = "N/A"
-            result.at[idx, "Care Label Color"]    = "N/A"
-            result.at[idx, "Care Label Supplier"] = "N/A"
-
+        result.at[idx, "Care Label"]          = care_id or care_code_mat or "N/A"
+        result.at[idx, "Care Label Color"]    = care_color or "N/A"
+        result.at[idx, "Care Label Supplier"] = resolve_supplier(care_code_mat)
         # ── Write: Content Code / TP FC / Care Code ────────────────────────
         result.at[idx, "Content Code"] = get_content("content_code", matched_cw, cw_num, color_raw)
         result.at[idx, "TP FC"]        = get_content("shell",        matched_cw, cw_num, color_raw)
