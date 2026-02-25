@@ -42,44 +42,7 @@ streamlit run app.py
 
 Opens at `http://localhost:8501`. If `streamlit` isn't recognized, use `python -m streamlit run app.py`.
 
----
 
-## File structure
-
-```
-bom_automation/
-├── app.py                   ← main UI: tabs, upload, validation, export
-├── requirements.txt
-│
-├── parsers/
-│   ├── pdf_parser.py        ← reads PDF, detects and routes sections
-│   ├── color_bom.py         ← extracts labels, hangtags, suppliers per colorway
-│   ├── costing.py           ← extracts FOB pricing
-│   └── care_content.py      ← extracts care codes and fiber content
-│
-├── validators/
-│   ├── filler.py            ← orchestrates all column-filling logic
-│   └── matcher.py           ← normalizes colorway strings for matching
-│
-└── exporters/
-    ├── excel_exporter.py    ← formatted Excel output
-    └── csv_exporter.py      ← plain CSV output
-```
-
----
-
-## Color/Option format support
-
-The matcher accepts any of these formats for the same colorway:
-
-- Code only: `010`
-- Code + name: `010-Black` or `010 Black`
-- Name only: `Black`
-
-Built-in colorways: 010 Black, 224 Camel Brown, 278 Dark Stone, 429 Everblue, 551 Lavender Pearl.
-To add more, edit `KNOWN_COLORWAYS` in `parsers/pdf_parser.py`.
-
----
 
 ## Troubleshooting
 
