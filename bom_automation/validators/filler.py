@@ -533,3 +533,4 @@ def validate_and_fill(
             result.at[idx, "Validation Status"] = "❌ Error: No BOM data matched"
 
     return result
+
