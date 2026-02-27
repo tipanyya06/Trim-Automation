@@ -114,6 +114,256 @@ def _get_material_code_for_comp(comp: dict) -> str:
     return ""
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Label Color Fallback — new self-contained block
+# Does NOT touch any existing function. Called only from validate_and_fill
+# after the primary get_color_from_spec attempt returns blank/N/A.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Cell values that mean "this row redirects to the colorway column name"
+_COLOR_REDIRECT_VALUES = {"artwork", "stock", "standard", "std"}
+
+
+def _strip_numeric_prefix(color_name: str) -> str:
+    """
+    Remove a leading numeric-dash prefix from a colorway column name.
+    e.g. "262-Canoe, Mountains" → "Canoe, Mountains"
+         "101 Black/White"      → "Black/White"
+    Leaves the string unchanged if no numeric prefix is found.
+    """
+    s = str(color_name).strip()
+    m = re.match(r'^\d+[-\s]+(.+)$', s)
+    return m.group(1).strip() if m else s
+
+
+def _find_target_col(df: "pd.DataFrame", matched_cw: str) -> "Optional[str]":
+    """
+    Find the column in df whose name best matches matched_cw.
+    Tries: exact → numeric-prefix → word-overlap.
+    Returns column name string or None.
+    """
+    cw_cols = [c for c in df.columns[1:] if c and not str(c).startswith("col_")]
+    # 1. Exact
+    if matched_cw in cw_cols:
+        return matched_cw
+    # 2. Numeric prefix: "262" matches "262-Canoe, Mountains"
+    num_prefix = re.match(r'^(\d+)', str(matched_cw) or "")
+    num_prefix = num_prefix.group(1) if num_prefix else ""
+    if num_prefix:
+        for col in cw_cols:
+            col_num = re.match(r'^(\d+)', str(col))
+            if col_num and col_num.group(1) == num_prefix:
+                return col
+    # 3. Word-overlap fallback
+    cw_words = set(re.split(r'[\s,/\-]+', matched_cw.lower()))
+    best_col, best_overlap = None, 0
+    for col in cw_cols:
+        col_words = set(re.split(r'[\s,/\-]+', str(col).lower()))
+        overlap = len(cw_words & col_words)
+        if overlap > best_overlap:
+            best_overlap, best_col = overlap, col
+    return best_col if best_overlap > 0 else None
+
+
+def _extract_code_from_comp_name(comp_name: str) -> str:
+    """
+    Extract the trailing material code from a component name string.
+    e.g. "Alt Hat Component 1A - 125802" → "125802"
+         "Label 1 - 003287"              → "003287"
+    Returns "" if no code found.
+    """
+    if not comp_name:
+        return ""
+    # Try " - CODE" suffix first (most common)
+    m = re.search(r'[-–]\s*(\d{4,7})\s*$', comp_name.strip())
+    if m:
+        return m.group(1)
+    # Try trailing digits
+    m = re.search(r'(\d{4,7})\s*$', comp_name.strip())
+    return m.group(1) if m else ""
+
+
+def _resolve_alt_component_color(
+    fallback_comp: str,
+    fallback_raw_sel: str,   # the raw settings string e.g. "Alt Hat Component 1A - 125802"
+    matched_cw: str,
+    color_raw: str,
+    color_bom_df,
+    color_spec_df,
+    get_color_fn,
+) -> tuple:
+    """
+    Shared helper: look up code + color for an alt component.
+
+    Returns (resolved_code, resolved_color) where either may be "".
+
+    Logic for each component row found:
+    • Cell is empty / None / nan  → skip this df, continue.
+    • Cell is a redirect value ("Artwork", "Stock", "Standard", "Std"):
+        - resolved_code  = code embedded in fallback_raw_sel name (e.g. 125802)
+        - resolved_color = get_color_fn(fallback_comp, matched_cw, color_raw)
+          called WITHOUT skipping artwork cells (uses a separate helper path)
+    • Cell has a real value:
+        - resolved_code  = code embedded in fallback_raw_sel name
+        - resolved_color = cell value
+
+    Last resort (no df row found):
+        - resolved_code  = code embedded in fallback_raw_sel name
+        - resolved_color = get_color_fn(fallback_comp, matched_cw, color_raw)
+    """
+    if not fallback_comp:
+        return ("", "")
+
+    # Extract the material code embedded in the component name/selection string
+    comp_code = _extract_code_from_comp_name(fallback_raw_sel or fallback_comp)
+
+    fb_lower = fallback_comp.strip().lower()
+
+    for df in (color_bom_df, color_spec_df):
+        if df is None or df.empty:
+            continue
+        comp_col = df.columns[0]
+        row_match = df[df[comp_col].astype(str).str.strip().str.lower() == fb_lower]
+        if row_match.empty:
+            row_match = df[
+                df[comp_col].astype(str).str.strip().str.lower()
+                .str.contains(re.escape(fb_lower), na=False)
+            ]
+        if row_match.empty:
+            continue
+
+        target_col = _find_target_col(df, matched_cw)
+        if target_col is None:
+            continue
+
+        cell_val   = str(row_match.iloc[0].get(target_col, "")).strip()
+        cell_lower = cell_val.lower()
+
+        if not cell_val or cell_lower in ("", "none", "nan"):
+            # Empty cell for this colorway → this fallback does NOT own this colorway row.
+            # Return ("", "") so the caller can try the next fallback.
+            return ("", "")
+
+        if cell_lower in _COLOR_REDIRECT_VALUES:
+            # "Artwork" / "Stock" → this fallback component owns this colorway.
+            # Code = the material code embedded in the component name (e.g. 125802).
+            # Color = strip the numeric prefix from the matched colorway column name.
+            # e.g. matched_cw "262-Canoe, Mountains" → color = "Canoe, Mountains"
+            #      matched_cw "010-Black"             → color = "Black"
+            color = _strip_numeric_prefix(target_col or matched_cw)
+            return (comp_code, color)
+
+        # Real color value in the cell (not a redirect, not empty)
+        return (comp_code, cell_val)
+
+    # No matching row found in either df — this fallback cannot resolve the colorway.
+    return ("", "")
+
+
+def _resolve_main_label_color_with_fallback(
+    primary_comp: str,
+    fallback_comp: str,          # Fallback 1 alt component name (enabled by use_fb1)
+    fallback_raw_sel: str,       # Fallback 1 raw settings string e.g. "Alt Hat 1A - 125802"
+    fallback_comp2: str,         # Fallback 2 alt component name (enabled by use_fb2)
+    fallback_raw_sel2: str,      # Fallback 2 raw settings string
+    matched_cw: str,
+    color_raw: str,
+    color_bom_df,                # pd.DataFrame | None
+    color_spec_df,               # pd.DataFrame | None
+    get_color_fn,                # callable: (comp_name, matched_cw, color_raw) → str
+    use_fb1: bool = False,
+    use_fb2: bool = False,
+    use_colorway_name: bool = False,  # Fallback 3: auto when any FB enabled
+) -> tuple:
+    """
+    Multi-step Main Label (code + color) resolver.
+
+    Returns (resolved_code, resolved_color).
+    resolved_code is "" when no fallback fires (caller keeps original main_code).
+    resolved_color is "" when nothing found.
+
+    Step 1 — Primary lookup (color only, code unchanged):
+        get_color_fn(primary_comp, matched_cw, color_raw).
+        If a real color is found → return ("", color).
+
+    Step 2 — Fallback 1 alt component (use_fb1=True):
+        _resolve_alt_component_color returns (fb_code, fb_color).
+        • If fb_code is set → this fallback OWNS this colorway row.
+          Use fb_code as the new Main Label code.
+          Use fb_color if found, else continue to FB2 for color only.
+        • If fb_code is empty (cell was blank) → this fallback doesn't apply, try FB2.
+
+    Step 3 — Fallback 2 alt component (use_fb2=True):
+        Same as Step 2 for fallback_comp2.
+
+    Step 4 — Colorway name fallback (use_colorway_name=True, auto-set when any FB enabled):
+        Strips numeric prefix from matched_cw.
+        e.g. "262-Canoe, Mountains" → "Canoe, Mountains"
+        Used as color-of-last-resort; code not changed here.
+
+    Returns ("", "") if nothing resolved.
+    """
+    # ── Step 1: primary color lookup ─────────────────────────────────────────
+    primary_color = get_color_fn(primary_comp, matched_cw, color_raw)
+    if primary_color and primary_color.lower() not in ("n/a", ""):
+        return ("", primary_color)
+
+    # ── Step 2: Fallback 1 alt component ─────────────────────────────────────
+    if use_fb1 and fallback_comp:
+        fb1_code, fb1_color = _resolve_alt_component_color(
+            fallback_comp, fallback_raw_sel,
+            matched_cw, color_raw, color_bom_df, color_spec_df, get_color_fn,
+        )
+        if fb1_code:
+            # This fallback owns this colorway row — its code becomes the Main Label
+            if fb1_color and fb1_color.lower() not in ("n/a", ""):
+                return (fb1_code, fb1_color)
+            # Code resolved but color still missing — try FB2 for color, keep fb1_code
+            if use_fb2 and fallback_comp2:
+                _, fb2_color = _resolve_alt_component_color(
+                    fallback_comp2, fallback_raw_sel2,
+                    matched_cw, color_raw, color_bom_df, color_spec_df, get_color_fn,
+                )
+                if fb2_color and fb2_color.lower() not in ("n/a", ""):
+                    return (fb1_code, fb2_color)
+            # Colorway name as last-resort color
+            if use_colorway_name and matched_cw:
+                stripped = _strip_numeric_prefix(matched_cw)
+                if stripped and stripped.lower() not in ("n/a", ""):
+                    return (fb1_code, stripped)
+            return (fb1_code, "")   # code resolved, color not found
+
+    # ── Step 3: Fallback 2 alt component ─────────────────────────────────────
+    if use_fb2 and fallback_comp2:
+        fb2_code, fb2_color = _resolve_alt_component_color(
+            fallback_comp2, fallback_raw_sel2,
+            matched_cw, color_raw, color_bom_df, color_spec_df, get_color_fn,
+        )
+        if fb2_code:
+            if fb2_color and fb2_color.lower() not in ("n/a", ""):
+                return (fb2_code, fb2_color)
+            # Color still missing — try colorway name
+            if use_colorway_name and matched_cw:
+                stripped = _strip_numeric_prefix(matched_cw)
+                if stripped and stripped.lower() not in ("n/a", ""):
+                    return (fb2_code, stripped)
+            return (fb2_code, "")
+
+    # ── Step 4: colorway column name fallback ────────────────────────────────
+    # No fallback component fired. Try colorway name as color-of-last-resort.
+    if use_colorway_name and matched_cw:
+        stripped = _strip_numeric_prefix(matched_cw)
+        if stripped and stripped.lower() not in ("n/a", ""):
+            return ("", stripped)
+
+    return ("", "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# End of fallback block
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def _find_supplier_in_costing(costing_df: pd.DataFrame, code: str) -> str:
     """Search costing detail rows for a material code and return the supplier."""
     if costing_df is None or costing_df.empty or not code or code == "N/A":
@@ -242,6 +492,11 @@ def validate_and_fill(
         return _nv(components.get(comp_key, {}).get("colorways", {}).get(matched_cw, ""))
 
     def get_color_from_spec(component_name: str, matched_cw: str, raw_color_option: str = "") -> str:
+        """
+        Look up a color value for component_name at matched_cw colorway.
+        Skips redirect-only cells ("Artwork", "Stock", "Standard", "Std") — these are handled
+        by the fallback resolver which calls _strip_numeric_prefix(matched_cw) directly.
+        """
         if not component_name:
             return ""
 
@@ -269,17 +524,22 @@ def validate_and_fill(
                 row_match = df[df[comp_col].str.lower().str.contains(lookup_name_lower, na=False, regex=False)]
             if row_match.empty:
                 return ""
-            cw_cols   = [c for c in df.columns[1:] if c and not str(c).startswith("col_")]
-            skip_vals = {"none", "nan", "stock", "artwork", ""}
+            cw_cols = [c for c in df.columns[1:] if c and not str(c).startswith("col_")]
+            # Skip empty/null values and redirect-only values (Artwork/Stock handled elsewhere)
+            _skip = {"none", "nan", ""} | _COLOR_REDIRECT_VALUES
+
+            def _accept(v: str) -> bool:
+                return v.lower() not in _skip
+
             if exact_cw in cw_cols:
                 v = str(row_match.iloc[0][exact_cw]).strip()
-                if v and v.lower() not in skip_vals:
+                if v and _accept(v):
                     return v
             if cw_prefix:
                 for col in cw_cols:
                     if str(col).split("-")[0].strip() == cw_prefix:
                         v = str(row_match.iloc[0][col]).strip()
-                        if v and v.lower() not in skip_vals:
+                        if v and _accept(v):
                             return v
             return ""
 
@@ -343,6 +603,18 @@ def validate_and_fill(
         # Support both old "Color/Option" and new "Color" column (Change 5)
         color_raw  = str(row.get("Color/Option", "") or row.get("Color", "")).strip()
         matched_cw = normalize_colorway(color_raw, available_cw)
+        if not matched_cw and available_cw:
+            # normalize_colorway failed — try a direct numeric-prefix rescue.
+            # Handles plain numbers like "657" matching "657-Nico, Red Oxide" in the BOM.
+            cw_raw_stripped = str(color_raw).strip()
+            num_only = re.match(r'^(\d+)$', cw_raw_stripped)
+            if num_only:
+                num = num_only.group(1)
+                for cw in available_cw:
+                    cw_num = re.match(r'^(\d+)', str(cw))
+                    if cw_num and cw_num.group(1) == num:
+                        matched_cw = cw
+                        break
         if not matched_cw:
             result.at[idx, "Validation Status"] = f"❌ Error: Unknown colorway '{color_raw}'"
             continue
@@ -374,6 +646,29 @@ def validate_and_fill(
         raw_rfid         = label_settings.get("hangtag_rfid", "")
         raw_rfid_sticker = label_settings.get("rfid_sticker", "")
         raw_upc          = label_settings.get("upc_sticker", "")
+
+        # ── Main Label Color fallback settings ─────────────────────────────
+        # Fallback 1: first alt component — enabled by checkbox
+        raw_main_fallback  = label_settings.get("main_label_fallback", "")
+        use_main_fallback  = bool(label_settings.get("use_main_label_fallback", False))
+        main_fallback_comp = (
+            raw_main_fallback.split(" - ")[0].strip()
+            if raw_main_fallback and raw_main_fallback not in ("N/A", "")
+            else ""
+        )
+
+        # Fallback 2: second alt component — enabled by checkbox
+        raw_main_fallback2  = label_settings.get("main_label_fallback2", "")
+        use_main_fallback2  = bool(label_settings.get("use_main_label_fallback2", False))
+        main_fallback_comp2 = (
+            raw_main_fallback2.split(" - ")[0].strip()
+            if raw_main_fallback2 and raw_main_fallback2 not in ("N/A", "")
+            else ""
+        )
+
+        # Fallback 3: colorway column name (strip numeric prefix) —
+        # activates automatically when FB1 or FB2 is enabled
+        use_colorway_name_fallback = use_main_fallback or use_main_fallback2
 
         main_comp, main_id   = split_comp(raw_main)
         care_comp, care_id   = split_comp(raw_care)
@@ -425,7 +720,7 @@ def validate_and_fill(
 
         upc_code = get_code(raw_upc.split(" - ")[0]) if raw_upc and raw_upc != "N/A" else get_code("Packaging 3")
         upc_cw   = get_cw_val("Packaging 3", matched_cw)
-        
+
         # RFID w/o MSRP — from settings, same fallback chain as raw_rfid, no fallback if empty
         rfid_no_msrp_code = rfid_no_msrp_sup = ""
         if raw_rfid_no_msrp and raw_rfid_no_msrp != "N/A":
@@ -447,17 +742,54 @@ def validate_and_fill(
             rfid_no_msrp_code = "N/A"
             rfid_no_msrp_sup  = "N/A"
 
-        # ── Colors ────────────────────────────────────────────────────────
-        main_color = get_color_from_spec(main_comp, matched_cw, color_raw)
+        # ── Colors ─────────────────────────────────────────────────────────
+        # Main Label Color (and potentially Main Label code) use the multi-step resolver:
+        #   Step 1: primary component color lookup
+        #   Step 2: Fallback 1 alt component — when use_main_fallback=True
+        #           "Artwork" cell → FB1 code becomes Main Label; color from FB1 spec row
+        #   Step 3: Fallback 2 alt component — when use_main_fallback2=True
+        #           Same as Step 2 for FB2
+        #   Step 4: colorway column name (strip numeric prefix) — auto when FB1 or FB2 enabled
+        resolved_main_code, main_color = _resolve_main_label_color_with_fallback(
+            primary_comp=main_comp,
+            fallback_comp=main_fallback_comp,
+            fallback_raw_sel=raw_main_fallback,
+            fallback_comp2=main_fallback_comp2,
+            fallback_raw_sel2=raw_main_fallback2,
+            matched_cw=matched_cw,
+            color_raw=color_raw,
+            color_bom_df=bom_data.get("color_bom"),
+            color_spec_df=color_spec,
+            get_color_fn=get_color_from_spec,
+            use_fb1=use_main_fallback,
+            use_fb2=use_main_fallback2,
+            use_colorway_name=use_colorway_name_fallback,
+        )
+        # ── Determine final Main Label code ──────────────────────────────────
+        # Priority order:
+        #   1. resolved_main_code — set by fallback chain (FB1 or FB2 fired "Artwork"/"Stock")
+        #      → this overrides everything: the fallback component owns this colorway row
+        #   2. main_id — extracted from the settings string "Comp Name - <CODE>"
+        #      → only used when NO fallback fired
+        #   3. main_code — get_code(main_comp) static extraction
+        #      → last resort if settings string had no embedded code
+        # NOTE: main_id must NOT override resolved_main_code — that was the core bug.
+        if resolved_main_code:
+            # A fallback component owns this colorway → its code is the Main Label
+            effective_main_code = resolved_main_code
+        else:
+            # Primary component keeps its code (static from settings)
+            effective_main_code = main_id or main_code or "N/A"
+
         care_color = get_color_from_spec(care_comp, matched_cw, color_raw)
         logo_color = get_color_from_spec("Label Logo 1", matched_cw, color_raw)
 
         # ── Write all columns (exact names match NEW_COLUMNS / export header) ──
 
         # Main Label (cols 1-3)
-        result.at[idx, "Main Label"]          = main_id or main_code or "N/A"
+        result.at[idx, "Main Label"]          = effective_main_code
         result.at[idx, "Main Label Color"]    = main_color or "N/A"
-        result.at[idx, "Main Label Supplier"] = resolve_supplier(main_code, "main_label")
+        result.at[idx, "Main Label Supplier"] = resolve_supplier(effective_main_code, "main_label")
 
         # Main Label 2 - Gloves (cols 4-6): additional/logo label, glove-specific
         result.at[idx, "Main Label 2- Gloves"]   = logo_code  if is_glove else "N/A"
@@ -479,7 +811,7 @@ def validate_and_fill(
         result.at[idx, "Size Label Supplier"]         = resolve_supplier(size_label_code) if is_glove else "N/A"
         result.at[idx, "Size Sticker -Gloves"]        = size_sticker_code if is_glove else "N/A"
         result.at[idx, "Size Sticker Supplier -Gloves"] = resolve_supplier(size_sticker_code) if is_glove else "N/A"
-    
+
         # Care Label (cols 19-20)
         result.at[idx, "Care Label"]       = care_id or care_code_mat or "N/A"
         result.at[idx, "Care Label Color"] = care_color or "N/A"
@@ -502,7 +834,6 @@ def validate_and_fill(
         # Care Supplier (col 27)
         result.at[idx, "Care Supplier"] = resolve_supplier(care_code_mat, "care_label")
 
-        
         # RFID w/o MSRP / RFID Stickers (cols 28-31)
         result.at[idx, "RFID w/o MSRP"]          = rfid_no_msrp_code
         result.at[idx, "RFID w/o MSRP Supplier"] = rfid_no_msrp_sup
@@ -519,18 +850,34 @@ def validate_and_fill(
             if not str(result.at[idx, field]).strip():
                 result.at[idx, field] = label_settings.get(key, "")
 
-        # ── Validation status ──────────────────────────────────────────────
+        # ── Validation status ───────────────────────────────────────────────
+        # Rule A: Main Label has a code/ID but Main Label Color is N/A
+        #   → always ⚠️ Partial with a hint about which fallbacks are still available.
+        main_label_val = str(result.at[idx, "Main Label"]).strip()
+        main_color_val = str(result.at[idx, "Main Label Color"]).strip()
+        label_has_value = main_label_val not in ("N/A", "", "nan")
+        color_missing   = main_color_val in ("N/A", "", "nan")
+
         core_cols = [
             "Main Label", "Main Label Supplier", "Care Label", "Care Supplier",
             "Content Code", "Care Code", "Hangtag", "Hangtag Supplier",
         ]
         not_found = sum(1 for c in core_cols if str(result.at[idx, c]) in ("N/A", "", "nan"))
-        if not_found == 0:
-            result.at[idx, "Validation Status"] = "✅ Validated"
-        elif not_found < len(core_cols):
+
+        if not_found == len(core_cols):
+            result.at[idx, "Validation Status"] = "❌ Error: No BOM data matched"
+        elif label_has_value and color_missing:
+            # Build a hint listing which fallbacks are still inactive / exhausted
+            if not use_main_fallback and not use_main_fallback2:
+                fallback_note = " — enable Fallback 1 or Fallback 2 (alt component) in Settings"
+            elif not use_main_fallback2:
+                fallback_note = " — enable Fallback 2 (second alt component) in Settings"
+            else:
+                fallback_note = " — all fallbacks active but color not found"
+            result.at[idx, "Validation Status"] = f"⚠️ Partial: Main Label Color missing{fallback_note}"
+        elif not_found > 0:
             result.at[idx, "Validation Status"] = "⚠️ Partial"
         else:
-            result.at[idx, "Validation Status"] = "❌ Error: No BOM data matched"
+            result.at[idx, "Validation Status"] = "✅ Validated"
 
     return result
-

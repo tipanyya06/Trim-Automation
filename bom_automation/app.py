@@ -437,7 +437,6 @@ def show_bom_inspector(style_key, bom_data):
     search = st.text_input("Filter rows", key=filter_key, placeholder="Filter rows...")
     view_df = bom_data[active_sec].copy()
 
-    # Keep Costing BOM focused on the key business columns.
     if active_sec == "costing_detail" and not view_df.empty:
         preferred_cols = ["component", "material", "description", "supplier", "country of origin"]
         normalized = {str(c).strip().lower(): c for c in view_df.columns}
@@ -445,7 +444,6 @@ def show_bom_inspector(style_key, bom_data):
         if keep:
             view_df = view_df[keep]
     elif active_sec == "color_bom" and not view_df.empty:
-        # Hide "line slot" helper columns in Color BOM display.
         drop_cols = [
             c for c in view_df.columns
             if "line" in str(c).strip().lower() and "slot" in str(c).strip().lower()
@@ -526,7 +524,6 @@ def render_pdf_tab():
     pdf_data_list  = [(f.name, f.read()) for f in uploaded_pdfs]
     current_fnames = {fname for fname, _ in pdf_data_list}
 
-    # Evict stale cached BOMs (files removed from uploader)
     stale_fnames = [fn for fn in list(pdf_hashes.keys()) if fn not in current_fnames]
     stale_hashes = {pdf_hashes.pop(fn) for fn in stale_fnames}
     for style in list(bom_dict.keys()):
@@ -638,7 +635,6 @@ def render_pdf_tab():
             st.rerun()
         else:
             st.session_state["pending_conflicts"] = {}
-            # Refresh sidebar/status badges immediately after successful parse.
             st.rerun()
 
     pending_conflicts = st.session_state.get("pending_conflicts", {})
@@ -823,7 +819,6 @@ def render_comparison_tab():
     render_section_header("BOM Comparison & Validation")
     if st.session_state.get("post_validation_prompt"):
         show_validation_complete_dialog()
-        return
 
     bom_dict = st.session_state.get("bom_dict", {})
     if not bom_dict:
@@ -838,14 +833,25 @@ def render_comparison_tab():
     )
     if comp_file is not None:
         raw_bytes = comp_file.getvalue()
+        new_sig = f"{comp_file.name}:{len(raw_bytes)}"
+        # If a NEW file was uploaded (different from cached), clear old validation
+        if st.session_state.get("comparison_upload_sig") != new_sig:
+            st.session_state.pop("validation_result", None)
+            st.session_state.pop("validation_mode", None)
         st.session_state["comparison_upload_bytes"] = raw_bytes
         st.session_state["comparison_upload_name"] = comp_file.name
         st.session_state["comparison_upload_size"] = len(raw_bytes)
+        st.session_state["comparison_upload_sig"] = new_sig
     else:
         cached_bytes = st.session_state.get("comparison_upload_bytes")
-        cached_name = st.session_state.get("comparison_upload_name")
+        cached_name  = st.session_state.get("comparison_upload_name")
         if not cached_bytes or not cached_name:
+            # Truly no file — clear stale validation and stop
+            st.session_state.pop("validation_result", None)
+            st.session_state.pop("validation_mode", None)
+            st.session_state.pop("comparison_upload_sig", None)
             return
+         # Restore from cache so the rest of the tab renders normally
         restored = _io.BytesIO(cached_bytes)
         restored.name = cached_name
         comp_file = restored
@@ -890,13 +896,10 @@ def render_comparison_tab():
             st.markdown(auto_detected_note, unsafe_allow_html=True)
         col_a, col_b, col_c_map = st.columns(3, gap="medium")
         with col_a:
-            # Change 5: supports both JDE Style (new) and Buyer Style Number (old)
             style_col = st.selectbox("JDE Style / Style Number column", options=list(comp_df.columns), index=list(comp_df.columns).index(default_style) if default_style in comp_df.columns else 0)
         with col_b:
-            # Change 5: supports both Color (new) and Color/Option (old)
             color_col = st.selectbox("Color column", options=list(comp_df.columns), index=list(comp_df.columns).index(default_color) if default_color in comp_df.columns else 0)
         with col_c_map:
-            # Change 5/6: Material Name for glove/beanie detection
             mat_options = ["(none)"] + list(comp_df.columns)
             mat_default_idx = mat_options.index(default_material) if default_material in mat_options else 0
             material_col = st.selectbox("Material Name column (Glove/Beanie detection)", options=mat_options, index=mat_default_idx)
@@ -942,7 +945,31 @@ def render_comparison_tab():
         saved      = label_selections.get(style_key, {})
         na_opts    = ["N/A"] + components
 
-        with st.expander(f"⚙ Settings — {style_key}", expanded=False):
+        # ── Build expander title with product type and SMU Type ───────────────
+        _meta_s   = bom_data_s.get("metadata", {})
+        _smu_type = str(_meta_s.get("smu_type", _meta_s.get("SMU Type", "N/A"))).strip()
+        _smu_type = _smu_type if _smu_type and _smu_type.lower() not in ("", "nan", "none") else "N/A"
+        # Detect product type from style_description or description fields
+        _style_desc = str(_meta_s.get("style_description", _meta_s.get("description", ""))).lower()
+        if "glove" in _style_desc or "mitt" in _style_desc:
+            _prod_type_label = "Gloves"
+        elif "beanie" in _style_desc or "hat" in _style_desc or "cap" in _style_desc or "cuffed" in _style_desc:
+            _prod_type_label = "Beanie"
+        else:
+            # Fallback: scan components list for product type hints
+            _comp_str = " ".join(str(c).lower() for c in components)
+            if "glove" in _comp_str or "mitt" in _comp_str:
+                _prod_type_label = "Gloves"
+            elif "beanie" in _comp_str or "hat" in _comp_str or "cuffed" in _comp_str:
+                _prod_type_label = "Beanie"
+            else:
+                _prod_type_label = ""
+        _expander_label = f"⚙ Settings — {style_key}"
+        if _prod_type_label:
+            _expander_label += f" · {_prod_type_label}"
+        _expander_label += f" · SMU: {_smu_type}"
+
+        with st.expander(_expander_label, expanded=False):
             if not components:
                 st.warning(f"No label components found for {style_key}.")
                 label_selections[style_key] = saved
@@ -968,7 +995,7 @@ def render_comparison_tab():
                 r1a, r1b = st.columns(2)
                 with r1a:
                     main_sel = st.selectbox("Main Label", options=components,
-                        index=components.index(_best(saved.get("main_label",""), ["label logo 1","Label 1","Main Label"])) if _best(saved.get("main_label",""), ["label logo 1","Label 1","Main Label"]) in components else 0,
+                        index=components.index(_best(saved.get("main_label",""), ["label logo 1","Hat Component ","Main Label"])) if _best(saved.get("main_label",""), ["label logo 1","Label 1","Main Label"]) in components else 0,
                         key=f"main_label_{style_key}")
                 with r1b:
                     add_main_sel = st.selectbox("Additional Main Label", options=na_opts,
@@ -1028,7 +1055,7 @@ def render_comparison_tab():
                         index=na_opts.index(rfid_sticker_default) if rfid_sticker_default in na_opts else 0,
                         key=f"rfid_sticker_{style_key}")
 
-                # Row 5: UPC / Content Code & Care Code (auto-filled info)
+                # Row 5: UPC / RFID w/o MSRP
                 r5a, r5b = st.columns(2)
                 with r5a:
                     upc_default = _pick_option(na_opts, "packaging 3", fallback="N/A")
@@ -1039,7 +1066,94 @@ def render_comparison_tab():
                     rfid_no_msrp_sel = st.selectbox("RFID w/o MSRP", options=na_opts,
                         index=na_opts.index(saved.get("rfid_no_msrp","N/A")) if saved.get("rfid_no_msrp","N/A") in na_opts else 0,
                         key=f"rfid_no_msrp_{style_key}")
-                    # st.caption("Content Code / Care Code / Content Code-Gloves / Care Code-Gloves — auto-filled from BOM")
+
+                # ── Main Label Color Fallback Settings ──────────────────────
+                st.markdown(
+                    "<div style='margin-top:0.7rem;margin-bottom:0.35rem;"
+                    "font-size:0.72rem;font-weight:700;letter-spacing:0.07em;"
+                    "text-transform:uppercase;color:#4a6286;border-top:1px solid #dce6f2;"
+                    "padding-top:0.6rem;'>"
+                    "Main Label Color — Fallback Settings"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    "<div style='font-size:0.78rem;color:#5f7a9e;margin-bottom:0.5rem;line-height:1.45;'>"
+                    "When the primary component lookup returns no color, these fallbacks are tried "
+                    "<b>in order</b>. Fallback 3 (colorway name) activates automatically when "
+                    "Fallback 1 or Fallback 2 is enabled."
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+                # Auto-select hat fallbacks when main label is Hat Component / 117027.
+                _main_norm = str(main_sel).strip().lower()
+                if ("hat component" in _main_norm) or ("117027" in _main_norm):
+                    fb1_auto = next((o for o in na_opts if "alt hat component 1a" in str(o).lower()), None)
+                    fb2_auto = next((o for o in na_opts if "alt hat component 1b" in str(o).lower()), None)
+                    if fb1_auto:
+                        st.session_state[f"main_label_fallback_{style_key}"] = fb1_auto
+                        st.session_state[f"use_main_label_fallback_{style_key}"] = True
+                    if fb2_auto:
+                        st.session_state[f"main_label_fallback2_{style_key}"] = fb2_auto
+                        st.session_state[f"use_main_label_fallback2_{style_key}"] = True
+
+                # Fallback 1 — first alt component dropdown + enable checkbox
+                fb1_col_a, fb1_col_b = st.columns([3, 1])
+                with fb1_col_a:
+                    fb1_sel = st.selectbox(
+                        "Fallback 1 — Alt component for color lookup",
+                        options=na_opts,
+                        index=na_opts.index(saved.get("main_label_fallback", "N/A"))
+                            if saved.get("main_label_fallback", "N/A") in na_opts else 0,
+                        key=f"main_label_fallback_{style_key}",
+                        help="Select an alternate BOM component. Its color cell for the matched "
+                             "colorway will be used. If the cell says 'Artwork'/'Stock', the "
+                             "colorway column name (stripped of its numeric prefix) is used instead.",
+                    )
+                with fb1_col_b:
+                    use_fb1 = st.checkbox(
+                        "Enable",
+                        value=bool(saved.get("use_main_label_fallback", False)),
+                        key=f"use_main_label_fallback_{style_key}",
+                        help="Activate Fallback 1.",
+                    )
+
+                # Fallback 2 — second alt component dropdown + enable checkbox
+                fb2_col_a, fb2_col_b = st.columns([3, 1])
+                with fb2_col_a:
+                    fb2_sel = st.selectbox(
+                        "Fallback 2 — Alt component for color lookup",
+                        options=na_opts,
+                        index=na_opts.index(saved.get("main_label_fallback2", "N/A"))
+                            if saved.get("main_label_fallback2", "N/A") in na_opts else 0,
+                        key=f"main_label_fallback2_{style_key}",
+                        help="Select a second alternate BOM component. Tried only if Fallback 1 "
+                             "also returns no color.",
+                    )
+                with fb2_col_b:
+                    use_fb2 = st.checkbox(
+                        "Enable",
+                        value=bool(saved.get("use_main_label_fallback2", False)),
+                        key=f"use_main_label_fallback2_{style_key}",
+                        help="Activate Fallback 2.",
+                    )
+
+                # Fallback 3 — colorway name, automatic (info only, no checkbox)
+                st.markdown(
+                    "<div style='font-size:0.78rem;color:#3a5278;padding:0.38rem 0 0.1rem 0;"
+                    "font-weight:600;'>"
+                    "Fallback 3 — Use colorway name (strip numeric prefix) "
+                    "<span style='font-size:0.7rem;color:#7090b4;font-weight:400;'>"
+                    "— auto-enabled when FB1 or FB2 is on</span>"
+                    "</div>"
+                    "<div style='font-size:0.74rem;color:#7090b4;line-height:1.35;margin-bottom:0.3rem;'>"
+                    "e.g. matched colorway <code>262-Canoe, Mountains</code> "
+                    "→ color becomes <b>Canoe, Mountains</b>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                # ── End fallback settings ───────────────────────────────────
 
                 # Row 6: Free-text fields
                 r6a, r6b, r6c, r6d = st.columns(4)
@@ -1053,19 +1167,25 @@ def render_comparison_tab():
                     remarks = st.text_input("Remarks", value=saved.get("remarks",""), key=f"remarks_{style_key}")
 
                 label_selections[style_key] = {
-                    "main_label":     main_sel,
-                    "add_main_label": add_main_sel,
-                    "hangtag":        ht_sel,
-                    "hangtag2":       ht2_sel,
-                    "hangtag3":       ht3_sel,
-                    "micropack":      micro_sel,
-                    "size_label":     size_label_sel,
-                    "size_sticker":   size_sticker_sel,
-                    "care_label":     care_sel,
-                    "hangtag_rfid":   rfid_sel,
-                    "rfid_no_msrp":   rfid_no_msrp_sel,
-                    "rfid_sticker":   rfid_sticker_sel,
-                    "upc_sticker":    upc_sel,
+                    "main_label":                main_sel,
+                    "add_main_label":            add_main_sel,
+                    "hangtag":                   ht_sel,
+                    "hangtag2":                  ht2_sel,
+                    "hangtag3":                  ht3_sel,
+                    "micropack":                 micro_sel,
+                    "size_label":                size_label_sel,
+                    "size_sticker":              size_sticker_sel,
+                    "care_label":                care_sel,
+                    "hangtag_rfid":              rfid_sel,
+                    "rfid_no_msrp":              rfid_no_msrp_sel,
+                    "rfid_sticker":              rfid_sticker_sel,
+                    "upc_sticker":               upc_sel,
+                    # Fallback settings
+                    "main_label_fallback":         fb1_sel,
+                    "use_main_label_fallback":     use_fb1,
+                    "main_label_fallback2":        fb2_sel,
+                    "use_main_label_fallback2":    use_fb2,
+                    # Free-text
                     "tp_status":      tp_status,
                     "tp_date":        tp_date,
                     "product_status": prod_status,
@@ -1090,6 +1210,16 @@ def render_comparison_tab():
         for f in quick_display_fields:
             val = str(picks.get(f, "N/A")).strip() or "N/A"
             chips.append(f"<span class='cx-chip'>{QUICK_SETTING_LABELS[f]}: {val}</span>")
+        # Show active fallbacks in the quick look
+        fb_active = []
+        if picks.get("use_main_label_fallback"):
+            fb_active.append(f"FB1: {picks.get('main_label_fallback','N/A')}")
+        if picks.get("use_main_label_fallback2"):
+            fb_active.append(f"FB2: {picks.get('main_label_fallback2','N/A')}")
+        if picks.get("use_main_label_fallback") or picks.get("use_main_label_fallback2"):
+            fb_active.append("FB3: Colorway Name (auto)")
+        if fb_active:
+            chips.append(f"<span class='cx-chip'>Color Fallbacks: {' → '.join(fb_active)}</span>")
         st.markdown(
             f"""
             <div class="cx-style-card">
@@ -1181,18 +1311,12 @@ def render_comparison_tab():
         combined = pd.concat(result_parts, ignore_index=True) if result_parts else renamed_df
 
         if not use_settings:
-            # Remap Option 2 internal column names → Option 1 output names
             combined = combined.rename(columns=QUICK_COLUMN_REMAP)
-            # Keep original input columns + Option 1 output columns only
             original_cols = [c for c in combined.columns if c not in NEW_COLUMNS and c not in QUICK_COLUMNS
                              and c not in QUICK_COLUMN_REMAP.values()]
             keep = original_cols + [c for c in QUICK_COLUMNS if c in combined.columns]
             combined = combined[keep]
 
-        # Business rule for status:
-        # - Validated: no "N/A"
-        # - Partial: has at least one "N/A"
-        # - Error: no match / existing error
         status_scan_cols = [
             c for c in (NEW_COLUMNS + QUICK_COLUMNS)
             if c in combined.columns and c != "Validation Status"
@@ -1209,6 +1333,20 @@ def render_comparison_tab():
         if not show_hangtag_rfid:
             combined = combined.drop(columns=list(HANGTAG_RFID_OUTPUT_COLS), errors="ignore")
 
+        # Replace all blank / NaN cells with "N/A" so no output cell is ever empty
+        _skip_fill_cols = {"Validation Status"}
+        for _col in combined.columns:
+            if _col in _skip_fill_cols:
+                continue
+            combined[_col] = combined[_col].apply(
+                lambda v: "N/A"
+                if (
+                    v is None
+                    or (isinstance(v, float) and pd.isna(v))
+                    or str(v).strip() in ("", "nan", "None", "NaN")
+                )
+                else v
+            )
         st.session_state["validation_result"] = combined
         st.session_state["validation_mode"]   = "Trim (Purchasing)" if use_settings else "Quick Trim (Planning)"
 
@@ -1223,7 +1361,6 @@ def render_comparison_tab():
     pending_mode = st.session_state.get("pending_validation_run")
     if pending_mode:
         show_validation_confirm_dialog(pending_mode)
-        return
 
     execute_mode = st.session_state.pop("validation_to_execute", None)
     if execute_mode:
@@ -1237,7 +1374,6 @@ def render_comparison_tab():
         st.rerun()
 
 def render_results():
-    # Change 8: now called as its own tab in main()
     if "validation_result" not in st.session_state:
         render_info_banner("Run validation first to see results here.")
         return
@@ -1367,7 +1503,6 @@ def render_results():
 def main():
     inject_theme()
     render_sidebar()
-    # Change 8: 3rd tab for Results & Export
     tab_labels = [TAB_PDF, TAB_COMPARE, TAB_RESULTS]
     default_tab = st.session_state.pop("next_active_tab", None)
     default_tab = default_tab if default_tab in tab_labels else None
@@ -1381,6 +1516,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-

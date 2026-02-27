@@ -104,6 +104,88 @@ def _extract_metadata(first_page_text: str) -> Dict[str, Any]:
     if m:
         meta["production_lo"] = m.group(1)
 
+    # ── Extract SMU Type ──────────────────────────────────────────────────────
+    # The Color BOM header has a row like:
+    #   Style | Material Style | Style Description | Pattern | Base Size | Size Scale | Fit | SMU Type
+    # followed by a data row like:
+    #   CU0185 | 1911251 | City Trek™ Heavyweight Beanie | | O/S | O/S | Accessories | Color Add
+    #
+    # Strategy 1: find "SMU Type" label then grab the token(s) on the SAME line after it
+    smu_type = ""
+    lines = text.splitlines()
+
+    # Pass 1: Look for "SMU Type" as a column header and grab its value from the same line
+    for i, line in enumerate(lines):
+        if re.search(r'\bSMU\s+Type\b', line, re.IGNORECASE):
+            # Try to extract value after "SMU Type" on the same line
+            after = re.split(r'SMU\s+Type', line, flags=re.IGNORECASE, maxsplit=1)[-1].strip()
+            after = after.lstrip(':').strip()
+            if after and after.lower() not in ('', 'nan', 'none'):
+                smu_type = after
+                break
+
+            # Value is on the NEXT line — the data row looks like:
+            # "CC3305 2011062 Toddler O/S O/S Accessories N/A"
+            # SMU Type is always the LAST token on that row (after Accessories/Footwear/Apparel)
+            if i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                if next_line and not re.search(
+                    r'(Line Slot|Season|Designer|Fit Engineer|Merchandise)',
+                    next_line, re.IGNORECASE
+                ):
+                    # Extract the token immediately after Accessories/Footwear/Apparel
+                    m_fit = re.search(
+                        r'\b(?:Accessories|Footwear|Apparel)\b\s+(.+)$',
+                        next_line, re.IGNORECASE
+                    )
+                    if m_fit:
+                        smu_type = m_fit.group(1).strip()
+                    else:
+                        # Fallback: take only the last whitespace token
+                        tokens = next_line.split()
+                        if tokens:
+                            smu_type = tokens[-1].strip()
+                    break
+
+    # Pass 2: Scan for a line that contains known SMU Type values directly
+    # Common values: "N/A", "Color Add", "Size Add", "Color/Size Add", "SMU"
+    if not smu_type:
+        smu_value_pattern = re.compile(
+            r'\b(Color\s+Add|Size\s+Add|Color[/ ]Size\s+Add|SMU)\b',
+            re.IGNORECASE,
+        )
+        # We look in lines that are near the "Fit" column data row
+        # (the data row right after the Style/Material Style/... header row)
+        in_header_zone = False
+        for line in lines:
+            if re.search(r'\bFit\b.*\bSMU', line, re.IGNORECASE):
+                in_header_zone = True
+                continue
+            if in_header_zone:
+                m2 = smu_value_pattern.search(line)
+                if m2:
+                    smu_type = m2.group(0).strip()
+                    break
+                if line.strip():   # stop after first non-empty line following the header
+                    break
+
+    # Pass 3: Broad scan — find the data row containing Accessories/Footwear/Apparel
+    # The data row reads: "CC3305 2011062 Toddler O/S O/S Accessories N/A"
+    # SMU Type is the token(s) AFTER the Fit value (Accessories/Footwear/Apparel)
+    if not smu_type:
+        data_row_pattern = re.compile(
+            r'\b(?:Accessories|Footwear|Apparel)\b\s+(.+)$',
+            re.IGNORECASE,
+        )
+        for line in lines:
+            m3 = data_row_pattern.search(line)
+            if m3:
+                smu_type = m3.group(1).strip()
+                break
+
+    meta["smu_type"] = smu_type.strip() if smu_type else "N/A"
+    # ── End SMU Type extraction ───────────────────────────────────────────────
+
     meta.setdefault("style", "")
     meta.setdefault("season", "")
     meta.setdefault("design", "")
@@ -227,21 +309,6 @@ def _build_supplier_lookup(costing_detail_df: pd.DataFrame) -> Dict[str, str]:
 # ── Content Report Parser ─────────────────────────────────────────────────────
 
 def _parse_content_report_tables(tables: list) -> pd.DataFrame:
-    """
-    Dedicated parser for the Content Report table structure.
-
-    PDF layout (pdfplumber extracts it as one merged table):
-        Row A:  [CONTENT CODE: HUG Shell:...]  [Color Way Number]  [Color Way Name]
-        Row B:  [FRENCH | translation]          [023]               [City Grey]
-        Row C:  [GERMAN | translation]          [810]               [Hot Coral...]
-        Row D:  []                              [433]               [Mountain Blue...]
-        ...
-
-    Output — one row per colorway:
-        Color Way Number | Color Way Name | Content Code | Content Full
-        023              | City Grey      | HUG          | CONTENT CODE: HUG Shell:...
-        810              | Hot Coral...   | HUG          | ...
-    """
     all_rows = []
     for tbl in tables:
         for row in tbl:
@@ -254,11 +321,9 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
     if not all_rows:
         return pd.DataFrame()
 
-    # ── Step 1: Identify colorway number + name column indices ──────────────────
     cw_num_col_idx = None
     cw_name_col_idx = None
 
-    # First pass: look for explicit header text "Color Way Number" / "Color Way Name"
     for row in all_rows[:10]:
         for i, cell in enumerate(row):
             cl = cell.lower()
@@ -267,7 +332,6 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
             if "color way name" in cl or "colorway name" in cl:
                 cw_name_col_idx = i
 
-    # Fallback: rightmost columns — find the one that most often holds 3-digit numbers
     if cw_num_col_idx is None and all_rows:
         num_cols = max(len(r) for r in all_rows)
         for candidate in range(num_cols - 1, -1, -1):
@@ -275,21 +339,16 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
                 1 for r in all_rows
                 if len(r) > candidate and re.match(r'^\d{3}$', r[candidate].strip())
             )
-            if hits >= 2:          # need at least 2 rows with a 3-digit value
+            if hits >= 2:
                 cw_num_col_idx = candidate
-                # Name column is immediately to the right (if it exists)
                 if candidate + 1 < num_cols:
                     cw_name_col_idx = candidate + 1
                 break
 
-    # ── Step 2: Collect all (cw_num, cw_name) pairs and the content code ────────
     current_content_code = ""
     current_content_full = ""
-
-    # colorway dict: {cw_num: cw_name}  — preserves first-seen order
     colorway_map: dict = {}
 
-    # Skip rows that are page-level noise (not actual table data)
     _skip_patterns = [
         r'content report line slot',
         r'color way number',
@@ -301,12 +360,9 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
     for row in all_rows:
         row_text = " ".join(row).lower()
 
-        # Skip page header / label rows
         if any(re.search(p, row_text) for p in _skip_patterns):
-            # But still grab the colorway data that may sit in the same row
-            pass  # fall through to colorway extraction below
+            pass
 
-        # Detect CONTENT CODE in any cell
         for cell in row:
             if "CONTENT CODE" in cell.upper():
                 m = re.search(r'CONTENT CODE[:\s]+(\w+)', cell, re.IGNORECASE)
@@ -315,7 +371,6 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
                     current_content_full = cell.strip()
                 break
 
-        # Extract colorway number + name from their dedicated columns
         cw_num = ""
         cw_name = ""
         if cw_num_col_idx is not None and len(row) > cw_num_col_idx:
@@ -323,14 +378,12 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
         if cw_name_col_idx is not None and len(row) > cw_name_col_idx:
             cw_name = row[cw_name_col_idx].strip()
 
-        # Only store rows where cw_num is a real 3-digit colorway number
         if re.match(r'^\d{3}$', cw_num) and cw_num not in colorway_map:
             colorway_map[cw_num] = cw_name
 
     if not colorway_map or not current_content_code:
         return pd.DataFrame()
 
-    # ── Step 3: Build clean output — one row per colorway ───────────────────────
     output_rows = [
         {
             "Color Way Number": cw_num,
@@ -427,7 +480,6 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
                     pass
 
                 else:
-                    # Content report pages go into a dedicated bucket for special parsing
                     tables_by_section.setdefault(section, []).append(tbl)
 
         # ── Build costing_detail DataFrame ─────────────────────────────────────
@@ -449,7 +501,6 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
         # ── Build all other section DataFrames ──────────────────────────────────
         for section, tables in tables_by_section.items():
 
-            # ── Special handling: content_report ───────────────────────────────
             if section == "content_report":
                 result["content_report"] = _parse_content_report_tables(tables)
                 continue
