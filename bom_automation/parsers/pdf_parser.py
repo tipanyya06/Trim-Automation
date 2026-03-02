@@ -4,6 +4,7 @@ from typing import Dict, Any
 import pandas as pd
 import pdfplumber
 
+from parsers.detail_sketch import parse_detail_sketches, get_sketch_color
 
 def _clean_table(rows):
     cleaned = []
@@ -32,6 +33,10 @@ def _rows_to_df(rows: list) -> pd.DataFrame:
         if name in seen:
             seen[name] += 1
             name = f"{name}_{seen[name]}"
+            if not c:
+                name = f"col_{i}"
+            else:
+                name = f"{c}_{seen[c]}"
         else:
             seen[name] = 0
         header.append(name)
@@ -104,36 +109,23 @@ def _extract_metadata(first_page_text: str) -> Dict[str, Any]:
     if m:
         meta["production_lo"] = m.group(1)
 
-    # ── Extract SMU Type ──────────────────────────────────────────────────────
-    # The Color BOM header has a row like:
-    #   Style | Material Style | Style Description | Pattern | Base Size | Size Scale | Fit | SMU Type
-    # followed by a data row like:
-    #   CU0185 | 1911251 | City Trek™ Heavyweight Beanie | | O/S | O/S | Accessories | Color Add
-    #
-    # Strategy 1: find "SMU Type" label then grab the token(s) on the SAME line after it
     smu_type = ""
     lines = text.splitlines()
 
-    # Pass 1: Look for "SMU Type" as a column header and grab its value from the same line
     for i, line in enumerate(lines):
         if re.search(r'\bSMU\s+Type\b', line, re.IGNORECASE):
-            # Try to extract value after "SMU Type" on the same line
             after = re.split(r'SMU\s+Type', line, flags=re.IGNORECASE, maxsplit=1)[-1].strip()
             after = after.lstrip(':').strip()
             if after and after.lower() not in ('', 'nan', 'none'):
                 smu_type = after
                 break
 
-            # Value is on the NEXT line — the data row looks like:
-            # "CC3305 2011062 Toddler O/S O/S Accessories N/A"
-            # SMU Type is always the LAST token on that row (after Accessories/Footwear/Apparel)
             if i + 1 < len(lines):
                 next_line = lines[i + 1].strip()
                 if next_line and not re.search(
                     r'(Line Slot|Season|Designer|Fit Engineer|Merchandise)',
                     next_line, re.IGNORECASE
                 ):
-                    # Extract the token immediately after Accessories/Footwear/Apparel
                     m_fit = re.search(
                         r'\b(?:Accessories|Footwear|Apparel)\b\s+(.+)$',
                         next_line, re.IGNORECASE
@@ -141,21 +133,16 @@ def _extract_metadata(first_page_text: str) -> Dict[str, Any]:
                     if m_fit:
                         smu_type = m_fit.group(1).strip()
                     else:
-                        # Fallback: take only the last whitespace token
                         tokens = next_line.split()
                         if tokens:
                             smu_type = tokens[-1].strip()
                     break
 
-    # Pass 2: Scan for a line that contains known SMU Type values directly
-    # Common values: "N/A", "Color Add", "Size Add", "Color/Size Add", "SMU"
     if not smu_type:
         smu_value_pattern = re.compile(
             r'\b(Color\s+Add|Size\s+Add|Color[/ ]Size\s+Add|SMU)\b',
             re.IGNORECASE,
         )
-        # We look in lines that are near the "Fit" column data row
-        # (the data row right after the Style/Material Style/... header row)
         in_header_zone = False
         for line in lines:
             if re.search(r'\bFit\b.*\bSMU', line, re.IGNORECASE):
@@ -166,12 +153,9 @@ def _extract_metadata(first_page_text: str) -> Dict[str, Any]:
                 if m2:
                     smu_type = m2.group(0).strip()
                     break
-                if line.strip():   # stop after first non-empty line following the header
+                if line.strip():
                     break
 
-    # Pass 3: Broad scan — find the data row containing Accessories/Footwear/Apparel
-    # The data row reads: "CC3305 2011062 Toddler O/S O/S Accessories N/A"
-    # SMU Type is the token(s) AFTER the Fit value (Accessories/Footwear/Apparel)
     if not smu_type:
         data_row_pattern = re.compile(
             r'\b(?:Accessories|Footwear|Apparel)\b\s+(.+)$',
@@ -184,7 +168,6 @@ def _extract_metadata(first_page_text: str) -> Dict[str, Any]:
                 break
 
     meta["smu_type"] = smu_type.strip() if smu_type else "N/A"
-    # ── End SMU Type extraction ───────────────────────────────────────────────
 
     meta.setdefault("style", "")
     meta.setdefault("season", "")
@@ -397,6 +380,88 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
     return pd.DataFrame(output_rows)
 
 
+# ── Color BOM horizontal merge ────────────────────────────────────────────────
+
+def _merge_color_bom_tables(tables: list) -> pd.DataFrame:
+    """
+    Color BOM may span multiple PDF pages/tables with the same component rows
+    but different colorway columns. Merge them horizontally by matching the
+    Component column.
+    """
+    dfs = [_rows_to_df(_clean_table(t)) for t in tables if t]
+    dfs = [df for df in dfs if not df.empty]
+    if not dfs:
+        return pd.DataFrame()
+    if len(dfs) == 1:
+        return dfs[0]
+
+    base = dfs[0].copy()
+    comp_col = base.columns[0]  # "Component"
+
+    _META_COLS = {"component", "details", "placement", "usage", "width", "marker width",
+                  "sap material code", "smu accounts"}
+
+    # Step 1: rename any col_N columns in base by matching data against named
+    # columns from subsequent pages (fixes the unnamed colorway column bug)
+    for extra_df in dfs[1:]:
+        named_cw_cols = [c for c in extra_df.columns if re.match(r'^\d{3}-', str(c))]
+        for named_col in named_cw_cols:
+            for base_col in list(base.columns):
+                if not str(base_col).startswith("col_"):
+                    continue
+                base_vals = set(base[base_col].dropna().astype(str)) - {"", "None", "nan"}
+                extra_vals = set(extra_df[named_col].dropna().astype(str)) - {"", "None", "nan"}
+                if base_vals & extra_vals:
+                    base = base.rename(columns={base_col: named_col})
+                    break
+
+    # Step 2: merge new colorway columns from each extra page
+    for extra_df in dfs[1:]:
+        if extra_df.empty:
+            continue
+        extra_comp_col = extra_df.columns[0]
+
+        new_cw_cols = [
+            c for c in extra_df.columns[1:]
+            if str(c).lower() not in _META_COLS
+            and not str(c).startswith("col_")
+            and re.match(r'^\d{3}-', str(c))
+        ]
+        if not new_cw_cols:
+            new_cw_cols = [
+                c for c in extra_df.columns[1:]
+                if str(c).lower() not in _META_COLS
+            ]
+
+        for cw_col in new_cw_cols:
+            if cw_col in base.columns:
+                # Column already exists — fill in any missing (None) values
+                cw_map = {}
+                for _, row in extra_df.iterrows():
+                    comp_val = str(row.get(extra_comp_col, "")).strip()
+                    cell_val = str(row.get(cw_col, "")).strip()
+                    if comp_val and cell_val and cell_val.lower() not in ("none", "nan", ""):
+                        cw_map[comp_val] = cell_val
+                mask = base[cw_col].isna() | base[cw_col].isin(["", "None", "nan"])
+                base.loc[mask, cw_col] = base.loc[mask, comp_col].apply(
+                    lambda v: cw_map.get(str(v).strip(), None)
+                )
+                continue
+
+            # New column — build map and add it
+            cw_map = {}
+            for _, row in extra_df.iterrows():
+                comp_val = str(row.get(extra_comp_col, "")).strip()
+                cell_val = str(row.get(cw_col, "")).strip()
+                if comp_val and cell_val and cell_val.lower() not in ("none", "nan", ""):
+                    cw_map[comp_val] = cell_val
+            base[cw_col] = base[comp_col].apply(
+                lambda v: cw_map.get(str(v).strip(), None)
+            )
+
+    return base
+
+
 # ── Main Parser ───────────────────────────────────────────────────────────────
 
 def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
@@ -505,6 +570,13 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
                 result["content_report"] = _parse_content_report_tables(tables)
                 continue
 
+            # FIX: use horizontal merge for color BOMs so colorways that span
+            # multiple PDF pages are merged into a single DataFrame instead of
+            # being stacked (which left most colorway cells as None).
+            if section in ("color_bom", "colorless_bom"):
+                result[section] = _merge_color_bom_tables(tables)
+                continue
+
             all_rows, expected_cols = [], None
             for t in tables:
                 for row in t:
@@ -517,10 +589,14 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
                     all_rows.append(cleaned)
             result[section] = _rows_to_df(all_rows)
 
-    for key in ["color_bom", "colorless_bom", "color_specification",
-                "costing_summary", "costing_detail", "care_report",
-                "content_report", "measurements", "sales_sample", "hangtag_report"]:
-        result.setdefault(key, pd.DataFrame())
+        for key in ["color_bom", "colorless_bom", "color_specification",
+                    "costing_summary", "costing_detail", "care_report",
+                    "content_report", "measurements", "sales_sample", "hangtag_report"]:
+            result.setdefault(key, pd.DataFrame())
 
-    result["supplier_lookup"] = _build_supplier_lookup(result.get("costing_detail", pd.DataFrame()))
+        result["supplier_lookup"] = _build_supplier_lookup(result.get("costing_detail", pd.DataFrame()))
+        result["detail_sketch"] = parse_detail_sketches(pdf)
+
+        return result
+
     return result

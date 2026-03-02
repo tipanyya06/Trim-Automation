@@ -7,7 +7,14 @@ import streamlit as st
 
 from exporters.excel_exporter import export_to_excel
 from exporters.csv_exporter import export_to_csv
-from parsers.pdf_parser import parse_bom_pdf
+from parsers.pdf_parser import parse_bom_pdf as _parse_bom_pdf_raw
+
+
+@st.cache_data(show_spinner=False, max_entries=50)
+def _parse_bom_pdf_cached(raw_bytes: bytes):
+    """Cache parsed BOM by file content hash — avoids re-parsing same PDF."""
+    import io as _cache_io
+    return _parse_bom_pdf_raw(_cache_io.BytesIO(raw_bytes))
 from validators.matcher import auto_detect_columns, get_product_type
 from validators.filler import validate_and_fill, NEW_COLUMNS, QUICK_COLUMNS, QUICK_COLUMN_REMAP
 from ui_styles import THEME_CSS
@@ -20,7 +27,13 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-STYLES_PER_PAGE = 5
+# Settings: 10 styles per page
+STYLES_PER_PAGE = 10
+# Results: Grid=10, Tile=15, List=10 (was 9999)
+RESULTS_PER_PAGE_GRID = 10
+RESULTS_PER_PAGE_TILE = 15
+RESULTS_PER_PAGE_LIST = 10  # FIX: was 9999, now 10
+
 TAB_PDF = "\U0001f4c4 PDF Extraction"
 TAB_COMPARE = "\U0001f50d BOM Comparison & Validation"
 TAB_RESULTS = "\U0001f4ca Results & Export"
@@ -152,32 +165,44 @@ def _status_accent_color(status_label):
         return "#eb5b63"
     return "#4f89f7"
 
-def render_view_toggle(state_key, default="Grid", label="View", clear_state_keys=None, icon_only=False, right_align=False):
+
+# ── FIX 1: View toggle — preserve open style when switching views ─────────────
+def render_view_toggle(state_key, default="Grid", label="", clear_state_keys=None, icon_only=False, right_align=False):
+    """
+    Instant view toggle using st.segmented_control.
+    FIX: Does NOT clear selected/open style when switching views.
+    The clear_state_keys param is now ignored to prevent closing open styles.
+    """
     options = ["Grid", "Tile", "List"]
-    display_labels = {"Grid": "\u25a6 Grid", "Tile": "\u25a4 Tile", "List": "\u2630 List"}
-    icon_labels = {"Grid": "\u25a6", "Tile": "\u25a4", "List": "\u2630"}
+
     current = st.session_state.get(state_key, default)
     if current not in options:
         current = default
-        st.session_state[state_key] = default
+        st.session_state[state_key] = current
+
     if label:
         st.markdown(f"<div class='cx-meta'>{label}</div>", unsafe_allow_html=True)
-    st.markdown("<div class='cx-view-toggle'></div>", unsafe_allow_html=True)
-    if right_align:
-        cols = st.columns([9, 1, 1, 1])[1:]
-    else:
-        cols = st.columns(3)
-    for i, opt in enumerate(options):
-        with cols[i]:
-            btn_label = icon_labels.get(opt, opt) if icon_only else display_labels.get(opt, opt)
-            gray_only_toggles = {"loaded_boms_view", "results_view_mode"}
-            btn_type = "secondary" if state_key in gray_only_toggles else ("primary" if current == opt else "secondary")
-            if st.button(btn_label, key=f"{state_key}_{opt}", type=btn_type, use_container_width=not icon_only):
-                st.session_state[state_key] = opt
-                for k in (clear_state_keys or []):
-                    st.session_state[k] = None
-                st.rerun()
+
+    _seg_key = f"__seg_{state_key}"
+
+    def _on_change():
+        chosen = st.session_state.get(_seg_key, default)
+        prev   = st.session_state.get(state_key, default)
+        if chosen and prev != chosen:
+            st.session_state[state_key] = chosen
+            # FIX 1: Do NOT clear open/selected styles when switching view mode
+            # (removed the loop that cleared clear_state_keys)
+
+    st.segmented_control(
+        label="",
+        options=options,
+        default=current,
+        key=_seg_key,
+        label_visibility="collapsed",
+        on_change=_on_change,
+    )
     return st.session_state.get(state_key, default)
+
 
 def _style_color_hint(bom_data):
     meta = bom_data.get("metadata", {}) if isinstance(bom_data, dict) else {}
@@ -211,20 +236,34 @@ def _infer_material_from_row(row, columns):
     return "N/A"
 
 def _colors_for_style(df, style_col, color_col, style_key):
+    """Look up from precomputed cache built by _precompute_style_colors."""
+    cache = st.session_state.get("__style_colors_cache", {})
+    return cache.get(str(style_key).strip().upper(), [])
+
+
+def _precompute_style_colors(df, style_col, color_col):
+    """Build a dict of style -> [colors] in a single pass. Cache by df sig."""
+    sig = f"{style_col}:{color_col}:{df.shape}"
+    if st.session_state.get("__scc_hash") == sig:
+        return
+    result = {}
     if df is None or style_col not in df.columns or color_col not in df.columns:
-        return []
-    su = str(style_key).strip().upper()
-    out = []
-    for _, r in df[[style_col, color_col]].dropna(how="all").iterrows():
-        s = str(r.get(style_col, "")).strip()
-        c = str(r.get(color_col, "")).strip()
-        if not s or not c:
+        st.session_state["__style_colors_cache"] = result
+        st.session_state["__scc_hash"] = sig
+        return
+    for s_val, c_val in zip(
+        df[style_col].astype(str).str.strip(),
+        df[color_col].astype(str).str.strip()
+    ):
+        if not s_val or not c_val or s_val.lower() in ("nan","none") or c_val.lower() in ("nan","none"):
             continue
-        su2 = s.upper()
-        if su2 == su or su2 in su or su in su2:
-            if c not in out:
-                out.append(c)
-    return out
+        su = s_val.upper()
+        if su not in result:
+            result[su] = []
+        if c_val not in result[su]:
+            result[su].append(c_val)
+    st.session_state["__style_colors_cache"] = result
+    st.session_state["__scc_hash"] = sig
 
 def _render_popup_table(df):
     if df is None or df.empty:
@@ -248,6 +287,7 @@ def _render_popup_table(df):
     )
 
 
+# ── FIX: Faster pagination — avoid clearing unrelated state ──────────────────
 def render_pagination(page_key, current_page, total_pages, key_suffix="", show_page_text=True):
     if total_pages <= 1:
         return current_page
@@ -294,7 +334,7 @@ def render_sidebar():
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
             st.session_state["pdf_uploader_key"] = pdf_k
-            st.rerun()
+            st.rerun(scope="app")
         st.markdown(
             """
             <div class="cx-side-bottom">
@@ -466,25 +506,6 @@ def show_bom_inspector(style_key, bom_data):
         st.rerun()
 
 
-@st.dialog("Confirm Validation", width="small", dismissible=False)
-def show_validation_confirm_dialog(mode_key):
-    is_full = str(mode_key).lower() == "full"
-    label = "Trim (Purchasing)" if is_full else "Quick Trim (Planning)"
-    detail = "Use configured per-style settings and run full validation." if is_full else "Run fast validation from BOM extraction only."
-    st.markdown(f"<div class='cx-meta'>{label}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div style='font-size:0.86rem;color:#4f688c;margin-bottom:0.6rem;'>{detail}</div>", unsafe_allow_html=True)
-    c_cancel, c_confirm = st.columns(2)
-    with c_cancel:
-        if st.button("Cancel", key=f"cancel_run_{mode_key}", use_container_width=True):
-            st.session_state["pending_validation_run"] = None
-            st.rerun()
-    with c_confirm:
-        if st.button("Confirm", key=f"confirm_run_{mode_key}", type="primary", use_container_width=True):
-            st.session_state["validation_to_execute"] = mode_key
-            st.session_state["pending_validation_run"] = None
-            st.rerun()
-
-
 @st.dialog("Validation Complete", width="small", dismissible=False)
 def show_validation_complete_dialog():
     st.markdown("<div class='cx-meta'>Validation finished</div>", unsafe_allow_html=True)
@@ -496,7 +517,149 @@ def show_validation_complete_dialog():
         )
         time.sleep(1)
     st.session_state["post_validation_prompt"] = False
-    st.rerun()
+    st.rerun(scope="app")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED DETAIL CARD BUILDER (used in both Results & Comparison tabs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DETAIL_GROUPS = [
+    ("Label",   [
+        ("Main Label",          "Main Label"),
+        ("Main Label Color",    "Main Label Color"),
+        ("Main Label Supplier", "Main Label Supplier"),
+        ("Care Label",          "Care Label"),
+        ("Care Label Color",    "Care Label Color"),
+        ("Care Supplier",       "Care Supplier"),
+    ]),
+    ("Hangtag", [
+        ("Hangtag",             "Hangtag"),
+        ("Hangtag Supplier",    "Hangtag Supplier"),
+        ("Hangtag 2",           "Hangtag 2"),
+        ("Hangtag 3",           "Hangtag3"),
+        ("RFID w/o MSRP",       "RFID w/o MSRP"),
+        ("RFID w/o MSRP Sup",   "RFID w/o MSRP Supplier"),
+    ]),
+    ("Sticker", [
+        ("RFID Sticker",        "RFID Stickers"),
+        ("RFID Sticker Sup",    "RFID Stickers Supplier"),
+        ("UPC Bag Sticker",     "UPC Bag Sticker (Polybag)"),
+        ("UPC Supplier",        "UPC Supplier"),
+    ]),
+    ("Content", [
+        ("Content Code",        "Content Code"),
+        ("TP FC",               "TP FC"),
+        ("Care Code",           "Care Code"),
+    ]),
+]
+
+def _field_val(row, col):
+    v = str(row.get(col, "")).strip()
+    return v if v and v.lower() not in ("nan", "none", "") else "N/A"
+
+def _val_color(v):
+    if v == "N/A":
+        return "#b0b8c8"
+    return "#1a2b45"
+
+def _build_detail_card_html(row, accent, color_val, material_val, status_raw, res_cols_set, extra_fields=None):
+    """
+    Build a rich detail card. extra_fields is an optional dict of {label: value}
+    for settings fields (main_label, hangtag, etc.) shown in the Comparison tab.
+    """
+    if "✅" in status_raw:
+        sbg, sfg = "#d1fae5", "#065f46"
+    elif "⚠️" in status_raw:
+        sbg, sfg = "#fef9c3", "#854d0e"
+    else:
+        sbg, sfg = "#fee2e2", "#991b1b"
+
+    html = (
+        f"<div style='border-left:4px solid {accent};border-radius:10px;"
+        f"padding:14px 16px 12px;margin-bottom:10px;background:#fff;"
+        f"box-shadow:0 1px 6px rgba(0,0,0,0.08);'>"
+        # Top row: color + status badge
+        f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'>"
+        f"<div style='font-size:1rem;font-weight:700;color:#1a2b45;'>{escape(color_val)}</div>"
+        f"<span style='font-size:0.68rem;font-weight:700;padding:3px 10px;border-radius:999px;"
+        f"background:{sbg};color:{sfg};'>{escape(status_raw)}</span>"
+        f"</div>"
+        # Material row
+        f"<div style='font-size:0.74rem;color:#6b7a99;margin-bottom:10px;'>"
+        f"<span style='font-weight:700;color:#4a5568;'>Material:</span> {escape(material_val)}</div>"
+    )
+
+    # Validated BOM field groups (only shown in Results tab or if present)
+    for grp_label, fields in _DETAIL_GROUPS:
+        avail = [(lbl, col) for lbl, col in fields if col in res_cols_set]
+        if not avail:
+            continue
+        vals = [(lbl, _field_val(row, col)) for lbl, col in avail]
+        has_data = any(v != "N/A" for _, v in vals)
+        if not has_data:
+            continue
+
+        html += (
+            f"<div style='margin-bottom:8px;'>"
+            f"<div style='font-size:0.61rem;font-weight:800;letter-spacing:0.08em;"
+            f"text-transform:uppercase;color:#94a3b8;margin-bottom:4px;'>{grp_label}</div>"
+            f"<div style='display:flex;flex-wrap:wrap;gap:4px;'>"
+        )
+        for lbl, v in vals:
+            vc = _val_color(v)
+            bg = "#f1f5f9" if v != "N/A" else "#f8fafc"
+            html += (
+                f"<div style='display:inline-flex;flex-direction:column;padding:4px 8px;"
+                f"border-radius:6px;background:{bg};border:1px solid #e2e8f0;min-width:80px;max-width:180px;'>"
+                f"<span style='font-size:0.57rem;color:#94a3b8;font-weight:600;"
+                f"letter-spacing:0.04em;text-transform:uppercase;white-space:nowrap;overflow:hidden;"
+                f"text-overflow:ellipsis;'>{escape(lbl)}</span>"
+                f"<span style='font-size:0.74rem;font-weight:600;color:{vc};"
+                f"margin-top:1px;word-break:break-word;'>{escape(v)}</span>"
+                f"</div>"
+            )
+        html += "</div></div>"
+
+    # Extra settings fields (Comparison tab Quick Look with improved styling)
+    if extra_fields:
+        # Group extra fields into logical clusters
+        _extra_groups = {
+            "Labels": ["Main Label", "Additional Main Label", "Care Label"],
+            "Hangtags": ["Hangtag", "Hangtag2", "Hangtag3", "Hangtag (RFID)", "RFID w/o MSRP"],
+            "Stickers": ["Micropack Sticker-Gloves", "Size Label", "Size Sticker-Gloves",
+                         "RFID Sticker", "UPC Sticker (Polybag)"],
+            "Status": ["TP Status", "TP Date", "Product Status", "Remarks"],
+        }
+        for grp_label, grp_keys in _extra_groups.items():
+            grp_vals = [(k, extra_fields[k]) for k in grp_keys if k in extra_fields]
+            has_data = any(v not in ("N/A", "", None) for _, v in grp_vals)
+            if not grp_vals or not has_data:
+                continue
+            html += (
+                f"<div style='margin-bottom:8px;'>"
+                f"<div style='font-size:0.61rem;font-weight:800;letter-spacing:0.08em;"
+                f"text-transform:uppercase;color:#94a3b8;margin-bottom:4px;'>{grp_label}</div>"
+                f"<div style='display:flex;flex-wrap:wrap;gap:4px;'>"
+            )
+            for lbl, v in grp_vals:
+                display_v = str(v).strip() if v and str(v).strip() not in ("", "N/A", "nan", "None") else "N/A"
+                vc = _val_color(display_v)
+                bg = "#f1f5f9" if display_v != "N/A" else "#f8fafc"
+                html += (
+                    f"<div style='display:inline-flex;flex-direction:column;padding:4px 8px;"
+                    f"border-radius:6px;background:{bg};border:1px solid #e2e8f0;min-width:80px;max-width:180px;'>"
+                    f"<span style='font-size:0.57rem;color:#94a3b8;font-weight:600;"
+                    f"letter-spacing:0.04em;text-transform:uppercase;white-space:nowrap;overflow:hidden;"
+                    f"text-overflow:ellipsis;'>{escape(lbl)}</span>"
+                    f"<span style='font-size:0.74rem;font-weight:600;color:{vc};"
+                    f"margin-top:1px;word-break:break-word;'>{escape(display_v)}</span>"
+                    f"</div>"
+                )
+            html += "</div></div>"
+
+    html += "</div>"
+    return html
 
 
 def render_pdf_tab():
@@ -565,7 +728,7 @@ def render_pdf_tab():
             with ThreadPoolExecutor(max_workers=min(8, total_new)) as executor:
                 def _pre_parse(args):
                     fname, raw_bytes, fhash, idx = args
-                    bom_data = parse_bom_pdf(_io.BytesIO(raw_bytes))
+                    bom_data = _parse_bom_pdf_cached(raw_bytes)
                     style = bom_data.get("metadata", {}).get("style") or fname
                     return (fname, idx), style, bom_data, raw_bytes, fhash
                 futures = {executor.submit(_pre_parse, args): args[0] for args in unique_to_parse}
@@ -682,55 +845,116 @@ def render_pdf_tab():
         """,
         unsafe_allow_html=True,
     )
+
+    # FIX 1: View toggle — no longer clears inspect_popup_style
     view_mode = render_view_toggle(
         "loaded_boms_view",
         default="Grid",
         label="Loaded BOM View",
-        clear_state_keys=["inspect_popup_style"],
+        clear_state_keys=None,  # FIX: don't clear open style
         icon_only=False,
         right_align=False,
     )
 
+    # FIX 2: List shows max 10 items per page
+    BOMS_PER_PAGE_GRID = 10
+    BOMS_PER_PAGE_TILE = 15
+    BOMS_PER_PAGE_LIST = 10
+    bom_per_page = BOMS_PER_PAGE_LIST if view_mode == "List" else (BOMS_PER_PAGE_TILE if view_mode == "Tile" else BOMS_PER_PAGE_GRID)
+    total_bom_pages = max(1, -(-len(summary_rows) // bom_per_page))
+    bom_page_key = "loaded_boms_page"
+    bom_page = max(0, min(st.session_state.get(bom_page_key, 0), total_bom_pages - 1))
+    st.session_state[bom_page_key] = bom_page
+
+    page_summary_rows = summary_rows[bom_page * bom_per_page: (bom_page + 1) * bom_per_page]
+
     col_count = 1 if view_mode == "List" else (3 if view_mode == "Tile" else 2)
     deck_cols = st.columns(col_count)
-    for idx, row in enumerate(summary_rows):
+    for idx, row in enumerate(page_summary_rows):
         style = row["Style"]
+        global_idx = bom_page * bom_per_page + idx + 1
         status = row.get("Status", _style_validation_status(style))
         bg, border, fg, label = _status_style(status)
         accent = _status_accent_color(label)
-        list_index_badge = (
-            f"<span class='cx-index-badge'>{idx + 1}</span>"
-            if view_mode == "List" else ""
-        )
-        card_height_class = " cx-bom-card-compact" if view_mode != "List" else ""
+
         with deck_cols[idx % col_count]:
-            card_class = "cx-list-row" if view_mode == "List" else "cx-style-card"
-            st.markdown(
-                f"""
-                <div class="{card_class}{card_height_class}" style="border-left-color:{accent};">
-                  <div class="cx-style-top">
-                    <div>
-                      <div class="cx-style-id cx-style-id-row">{list_index_badge}<span>{style}</span></div>
-                      <div class="cx-style-name">{row.get('Design', 'BOM Style')}</div>
+            if view_mode == "List":
+                # FIX 2: Rich list row design
+                st.markdown(
+                    f"""
+                    <div class="cx-list-row" style="
+                        border-left:4px solid {accent};
+                        border-radius:10px;
+                        padding:12px 16px;
+                        margin-bottom:6px;
+                        background:#fff;
+                        box-shadow:0 1px 4px rgba(0,0,0,0.07);
+                        display:flex;
+                        align-items:center;
+                        gap:14px;
+                    ">
+                        <span style="
+                            font-size:0.7rem;font-weight:800;color:#9aabbd;
+                            min-width:22px;text-align:right;
+                        ">{global_idx}</span>
+                        <div style="flex:1;min-width:0;">
+                            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                                <span style="font-size:0.95rem;font-weight:800;color:#1a2b45;letter-spacing:-0.01em;">{style}</span>
+                                <span style="font-size:0.68rem;font-weight:700;padding:2px 9px;border-radius:999px;
+                                    background:{bg};border:1px solid {border};color:{fg};white-space:nowrap;">{label}</span>
+                            </div>
+                            <div style="font-size:0.75rem;color:#5a6a82;margin-top:2px;margin-bottom:5px;
+                                white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                                {row.get('Design','—')}
+                            </div>
+                            <div style="display:flex;flex-wrap:wrap;gap:4px;">
+                                <span class="cx-chip">Color: {row.get('Color','N/A')}</span>
+                                <span class="cx-chip">Season: {row['Season']}</span>
+                                <span class="cx-chip">LO: {row['LO']}</span>
+                                <span class="cx-chip">&#8862; {row['Sections']} Sections</span>
+                                <span class="cx-chip">&#9671; {row['Colorways']} Colorways</span>
+                            </div>
+                        </div>
                     </div>
-                    <div class="cx-status" style="background:{bg};border-color:{border};color:{fg};">{label}</div>
-                  </div>
-                  <div class="cx-chip-row">
-                    <span class="cx-chip">Color {row.get('Color', 'N/A')}</span>
-                    <span class="cx-chip">Season {row['Season']}</span>
-                    <span class="cx-chip">LO {row['LO']}</span>
-                  </div>
-                  <div class="cx-style-footer">
-                    <div class="cx-footer-meta">
-                      <span><span class="cx-count-num">&#8862; {row['Sections']}</span> <span class="cx-count-label">Sections</span></span>
-                      <span><span class="cx-count-num">&#9671; {row['Colorways']}</span> <span class="cx-count-label">Colorways</span></span>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                # Grid / Tile card — FIX 2: rich card design
+                number_badge = f"<span style='font-size:0.7rem;color:#9aabbd;font-weight:600;margin-right:4px;'>#{global_idx}</span>"
+                st.markdown(
+                    f"""
+                    <div class="cx-style-card" style="
+                        border-left:4px solid {accent};
+                        border-radius:10px;
+                        padding:14px 16px 10px;
+                        background:#fff;
+                        box-shadow:0 1px 6px rgba(0,0,0,0.08);
+                        margin-bottom:8px;
+                    ">
+                      <div class="cx-style-top">
+                        <div>
+                          <div class="cx-style-id cx-style-id-row">{number_badge}<span>{style}</span></div>
+                          <div class="cx-style-name" style="margin-top:2px;font-size:0.8rem;color:#5a6a82;">{row.get('Design','BOM Style')}</div>
+                        </div>
+                        <div class="cx-status" style="background:{bg};border-color:{border};color:{fg};">{label}</div>
+                      </div>
+                      <div class="cx-chip-row" style="margin-top:8px;">
+                        <span class="cx-chip">Color: {row.get('Color','N/A')}</span>
+                        <span class="cx-chip">Season: {row['Season']}</span>
+                        <span class="cx-chip">LO: {row['LO']}</span>
+                      </div>
+                      <div class="cx-style-footer" style="margin-top:8px;border-top:1px solid #f0f4f8;padding-top:8px;">
+                        <div class="cx-footer-meta">
+                          <span><span class="cx-count-num">&#8862; {row['Sections']}</span> <span class="cx-count-label">Sections</span></span>
+                          <span><span class="cx-count-num">&#9671; {row['Colorways']}</span> <span class="cx-count-label">Colorways</span></span>
+                        </div>
+                        <div class="cx-footer-hint" style="font-size:0.68rem;color:#9aabbd;">Click to inspect</div>
+                      </div>
                     </div>
-                    <div class="cx-footer-hint">Click to inspect</div>
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+                    """,
+                    unsafe_allow_html=True,
+                )
             hitbox_prefix = "card_hit_list" if view_mode == "List" else "card_hit_grid"
             with st.container(key=f"{hitbox_prefix}_{idx}"):
                 inspect_click = st.button(" ", key=f"inspect_card_{style}", use_container_width=True)
@@ -738,6 +962,9 @@ def render_pdf_tab():
                 st.session_state["pdf_inspect_style"] = style
                 st.session_state["inspect_popup_style"] = style
                 st.rerun()
+
+    # FIX 3: Pagination below cards
+    render_pagination(bom_page_key, bom_page, total_bom_pages, key_suffix="bom_pg", show_page_text=True)
 
     popup_style = st.session_state.get("inspect_popup_style")
     if popup_style and popup_style in bom_dict:
@@ -810,7 +1037,7 @@ def _normalize_supplier_names(df):
     supplier_cols = [c for c in out.columns if "supplier" in str(c).strip().lower()]
     for col in supplier_cols:
         out[col] = out[col].apply(
-            lambda v: "PT BSN" if isinstance(v, str) and v.strip().lower() == "bao shen" else v
+            lambda v: "PT BSN" if isinstance(v, str) and "bao shen" in v.strip().lower() else v
         )
     return out
 
@@ -834,7 +1061,6 @@ def render_comparison_tab():
     if comp_file is not None:
         raw_bytes = comp_file.getvalue()
         new_sig = f"{comp_file.name}:{len(raw_bytes)}"
-        # If a NEW file was uploaded (different from cached), clear old validation
         if st.session_state.get("comparison_upload_sig") != new_sig:
             st.session_state.pop("validation_result", None)
             st.session_state.pop("validation_mode", None)
@@ -846,12 +1072,10 @@ def render_comparison_tab():
         cached_bytes = st.session_state.get("comparison_upload_bytes")
         cached_name  = st.session_state.get("comparison_upload_name")
         if not cached_bytes or not cached_name:
-            # Truly no file — clear stale validation and stop
             st.session_state.pop("validation_result", None)
             st.session_state.pop("validation_mode", None)
             st.session_state.pop("comparison_upload_sig", None)
             return
-         # Restore from cache so the rest of the tab renders normally
         restored = _io.BytesIO(cached_bytes)
         restored.name = cached_name
         comp_file = restored
@@ -865,7 +1089,14 @@ def render_comparison_tab():
             st.rerun()
 
     try:
-        comp_df = _normalize_supplier_names(_read_comparison_file(comp_file))
+        _upload_sig = st.session_state.get("comparison_upload_sig", "")
+        if st.session_state.get("__norm_hash") != _upload_sig or "__norm_cache" not in st.session_state:
+            _raw_df = _read_comparison_file(comp_file)
+            comp_df = _normalize_supplier_names(_raw_df)
+            st.session_state["__norm_cache"] = comp_df
+            st.session_state["__norm_hash"]  = _upload_sig
+        else:
+            comp_df = st.session_state["__norm_cache"]
         st.session_state["comparison_raw"] = comp_df
     except Exception as e:
         st.error(f"Failed to read file: {e}")
@@ -875,7 +1106,13 @@ def render_comparison_tab():
     mapping_card = st.container(border=True, key="column_mapping_card")
     with mapping_card:
         st.markdown("""<div class="cx-meta" style="margin-bottom:0.35rem;">Column Mapping</div>""", unsafe_allow_html=True)
-        auto = auto_detect_columns(comp_df)
+        _adc_key = "__adc_" + str(list(comp_df.columns)) + str(comp_df.shape)
+        if st.session_state.get("__adc_hash") != _adc_key:
+            auto = auto_detect_columns(comp_df)
+            st.session_state["__adc_cache"] = auto
+            st.session_state["__adc_hash"]  = _adc_key
+        else:
+            auto = st.session_state["__adc_cache"]
         auto_detected_note = ""
         if auto and auto["confidence"] >= 0.7:
             default_style    = auto["style_col"]
@@ -907,6 +1144,7 @@ def render_comparison_tab():
                 material_col = None
         show_hangtag_rfid = "buyer style" in str(style_col).strip().lower()
         st.session_state["show_hangtag_rfid"] = show_hangtag_rfid
+        _precompute_style_colors(comp_df, style_col, color_col)
 
     st.markdown("<div style='height:0;'></div>", unsafe_allow_html=True)
     label_selections = st.session_state.get("label_selections", {})
@@ -935,35 +1173,50 @@ def render_comparison_tab():
             unsafe_allow_html=True,
         )
 
-    render_pagination("label_map_page", lm_page, total_lm_pages, key_suffix="lm", show_page_text=False)
-    st.markdown("<div style='height:0.15rem;'></div>", unsafe_allow_html=True)
-
     page_style_keys = all_style_keys[lm_page * STYLES_PER_PAGE: (lm_page + 1) * STYLES_PER_PAGE]
     for style_key in page_style_keys:
         bom_data_s = bom_dict[style_key]
-        components = _get_components_for_bom(bom_data_s)
+        _comp_cache = st.session_state.setdefault("_comp_cache", {})
+        if style_key not in _comp_cache:
+            _comp_cache[style_key] = _get_components_for_bom(bom_data_s)
+        components = _comp_cache[style_key]
         saved      = label_selections.get(style_key, {})
         na_opts    = ["N/A"] + components
 
-        # ── Build expander title with product type and SMU Type ───────────────
         _meta_s   = bom_data_s.get("metadata", {})
         _smu_type = str(_meta_s.get("smu_type", _meta_s.get("SMU Type", "N/A"))).strip()
         _smu_type = _smu_type if _smu_type and _smu_type.lower() not in ("", "nan", "none") else "N/A"
-        # Detect product type from style_description or description fields
-        _style_desc = str(_meta_s.get("style_description", _meta_s.get("description", ""))).lower()
-        if "glove" in _style_desc or "mitt" in _style_desc:
+        _search_parts = [
+            str(_meta_s.get("style_description", "")),
+            str(_meta_s.get("description", "")),
+            str(_meta_s.get("design", "")),
+            style_key,
+        ] + [str(c) for c in components]
+        _cb_s = bom_data_s.get("color_bom")
+        if isinstance(_cb_s, pd.DataFrame) and not _cb_s.empty:
+            _search_parts += [str(v) for v in _cb_s.iloc[:, 0].dropna()]
+        _search_str = " ".join(_search_parts).lower()
+
+        if "glove" in _search_str or "mitt" in _search_str:
             _prod_type_label = "Gloves"
-        elif "beanie" in _style_desc or "hat" in _style_desc or "cap" in _style_desc or "cuffed" in _style_desc:
+        elif (
+            "beanie" in _search_str or "cuffed" in _search_str
+            or "whirlibird" in _search_str
+            or ("hat" in _search_str and "component" in _search_str)
+        ):
             _prod_type_label = "Beanie"
+        elif "jacket" in _search_str or "vest" in _search_str or "parka" in _search_str or "anorak" in _search_str:
+            _prod_type_label = "Jacket"
+        elif "pant" in _search_str or "short" in _search_str or "bib" in _search_str:
+            _prod_type_label = "Pants"
+        elif "sock" in _search_str:
+            _prod_type_label = "Socks"
+        elif "boot" in _search_str or "shoe" in _search_str or "footwear" in _search_str:
+            _prod_type_label = "Footwear"
+        elif "bag" in _search_str or "backpack" in _search_str:
+            _prod_type_label = "Bag"
         else:
-            # Fallback: scan components list for product type hints
-            _comp_str = " ".join(str(c).lower() for c in components)
-            if "glove" in _comp_str or "mitt" in _comp_str:
-                _prod_type_label = "Gloves"
-            elif "beanie" in _comp_str or "hat" in _comp_str or "cuffed" in _comp_str:
-                _prod_type_label = "Beanie"
-            else:
-                _prod_type_label = ""
+            _prod_type_label = ""
         _expander_label = f"⚙ Settings — {style_key}"
         if _prod_type_label:
             _expander_label += f" · {_prod_type_label}"
@@ -982,27 +1235,34 @@ def render_comparison_tab():
                                 return opt
                     return fallback if fallback is not None else (options[0] if options else "N/A")
 
-                def _best(saved_val, preferred_names, _comps=components):
+                def _best(saved_val, preferred_names, _comps=components, exclude_alt=False):
                     if saved_val and saved_val in _comps:
                         return saved_val
                     for p in preferred_names:
+                        p_l = p.lower()
                         for c in _comps:
-                            if p.lower() in c.lower():
+                            c_l = c.lower()
+                            if p_l in c_l:
+                                if exclude_alt and c_l.startswith("alt"):
+                                    continue
                                 return c
                     return _comps[0]
 
-                # Row 1: Main Label / Additional Main Label
                 r1a, r1b = st.columns(2)
                 with r1a:
+                    _main_default = _best(
+                        saved.get("main_label", ""),
+                        ["label logo 1", "hat components", "hat component", "direct embroidery", "label 1", "main label"],
+                        exclude_alt=True,
+                    )
                     main_sel = st.selectbox("Main Label", options=components,
-                        index=components.index(_best(saved.get("main_label",""), ["label logo 1","Hat Component ","Main Label"])) if _best(saved.get("main_label",""), ["label logo 1","Label 1","Main Label"]) in components else 0,
+                        index=components.index(_main_default) if _main_default in components else 0,
                         key=f"main_label_{style_key}")
                 with r1b:
                     add_main_sel = st.selectbox("Additional Main Label", options=na_opts,
                         index=na_opts.index(saved.get("add_main_label","N/A")) if saved.get("add_main_label","N/A") in na_opts else 0,
                         key=f"add_main_label_{style_key}")
 
-                # Row 2: Hangtag / Hangtag2 / Hangtag3
                 r2a, r2b, r2c = st.columns(3)
                 with r2a:
                     hangtag_default = _pick_option(na_opts, "hangtag package part", "hangtag", fallback="N/A")
@@ -1018,7 +1278,6 @@ def render_comparison_tab():
                         index=na_opts.index(saved.get("hangtag3","N/A")) if saved.get("hangtag3","N/A") in na_opts else 0,
                         key=f"hangtag3_{style_key}")
 
-                # Row 3: Micropack / Size Label / Size Sticker (glove fields)
                 r3a, r3b, r3c = st.columns(3)
                 with r3a:
                     micro_sel = st.selectbox("Micropack Sticker-Gloves", options=na_opts,
@@ -1033,14 +1292,18 @@ def render_comparison_tab():
                         index=na_opts.index(saved.get("size_sticker","N/A")) if saved.get("size_sticker","N/A") in na_opts else 0,
                         key=f"size_sticker_{style_key}")
 
-                # Row 4: Care Label / Hangtag (RFID) / RFID Sticker
                 if show_hangtag_rfid:
                     r4a, r4b, r4c = st.columns(3)
                 else:
                     r4a, r4c = st.columns(2)
                 with r4a:
+                    _care_default = _best(
+                        saved.get("care_label", ""),
+                        ["label 1 -", "label 1", "care label"],
+                        exclude_alt=True,
+                    )
                     care_sel = st.selectbox("Care Label", options=components,
-                        index=components.index(_best(saved.get("care_label",""), ["Label 1","Care Label","Label1"])) if _best(saved.get("care_label",""), ["Label 1","Care Label","Label1"]) in components else 0,
+                        index=components.index(_care_default) if _care_default in components else 0,
                         key=f"care_label_{style_key}")
                 if show_hangtag_rfid:
                     with r4b:
@@ -1055,7 +1318,6 @@ def render_comparison_tab():
                         index=na_opts.index(rfid_sticker_default) if rfid_sticker_default in na_opts else 0,
                         key=f"rfid_sticker_{style_key}")
 
-                # Row 5: UPC / RFID w/o MSRP
                 r5a, r5b = st.columns(2)
                 with r5a:
                     upc_default = _pick_option(na_opts, "packaging 3", fallback="N/A")
@@ -1067,7 +1329,6 @@ def render_comparison_tab():
                         index=na_opts.index(saved.get("rfid_no_msrp","N/A")) if saved.get("rfid_no_msrp","N/A") in na_opts else 0,
                         key=f"rfid_no_msrp_{style_key}")
 
-                # ── Main Label Color Fallback Settings ──────────────────────
                 st.markdown(
                     "<div style='margin-top:0.7rem;margin-bottom:0.35rem;"
                     "font-size:0.72rem;font-weight:700;letter-spacing:0.07em;"
@@ -1086,7 +1347,6 @@ def render_comparison_tab():
                     unsafe_allow_html=True,
                 )
 
-                # Auto-select hat fallbacks when main label is Hat Component / 117027.
                 _main_norm = str(main_sel).strip().lower()
                 if ("hat component" in _main_norm) or ("117027" in _main_norm):
                     fb1_auto = next((o for o in na_opts if "alt hat component 1a" in str(o).lower()), None)
@@ -1098,7 +1358,6 @@ def render_comparison_tab():
                         st.session_state[f"main_label_fallback2_{style_key}"] = fb2_auto
                         st.session_state[f"use_main_label_fallback2_{style_key}"] = True
 
-                # Fallback 1 — first alt component dropdown + enable checkbox
                 fb1_col_a, fb1_col_b = st.columns([3, 1])
                 with fb1_col_a:
                     fb1_sel = st.selectbox(
@@ -1107,19 +1366,14 @@ def render_comparison_tab():
                         index=na_opts.index(saved.get("main_label_fallback", "N/A"))
                             if saved.get("main_label_fallback", "N/A") in na_opts else 0,
                         key=f"main_label_fallback_{style_key}",
-                        help="Select an alternate BOM component. Its color cell for the matched "
-                             "colorway will be used. If the cell says 'Artwork'/'Stock', the "
-                             "colorway column name (stripped of its numeric prefix) is used instead.",
                     )
                 with fb1_col_b:
                     use_fb1 = st.checkbox(
                         "Enable",
                         value=bool(saved.get("use_main_label_fallback", False)),
                         key=f"use_main_label_fallback_{style_key}",
-                        help="Activate Fallback 1.",
                     )
 
-                # Fallback 2 — second alt component dropdown + enable checkbox
                 fb2_col_a, fb2_col_b = st.columns([3, 1])
                 with fb2_col_a:
                     fb2_sel = st.selectbox(
@@ -1128,18 +1382,14 @@ def render_comparison_tab():
                         index=na_opts.index(saved.get("main_label_fallback2", "N/A"))
                             if saved.get("main_label_fallback2", "N/A") in na_opts else 0,
                         key=f"main_label_fallback2_{style_key}",
-                        help="Select a second alternate BOM component. Tried only if Fallback 1 "
-                             "also returns no color.",
                     )
                 with fb2_col_b:
                     use_fb2 = st.checkbox(
                         "Enable",
                         value=bool(saved.get("use_main_label_fallback2", False)),
                         key=f"use_main_label_fallback2_{style_key}",
-                        help="Activate Fallback 2.",
                     )
 
-                # Fallback 3 — colorway name, automatic (info only, no checkbox)
                 st.markdown(
                     "<div style='font-size:0.78rem;color:#3a5278;padding:0.38rem 0 0.1rem 0;"
                     "font-weight:600;'>"
@@ -1153,9 +1403,7 @@ def render_comparison_tab():
                     "</div>",
                     unsafe_allow_html=True,
                 )
-                # ── End fallback settings ───────────────────────────────────
 
-                # Row 6: Free-text fields
                 r6a, r6b, r6c, r6d = st.columns(4)
                 with r6a:
                     tp_status = st.text_input("TP Status", value=saved.get("tp_status",""), key=f"tp_status_{style_key}")
@@ -1180,12 +1428,10 @@ def render_comparison_tab():
                     "rfid_no_msrp":              rfid_no_msrp_sel,
                     "rfid_sticker":              rfid_sticker_sel,
                     "upc_sticker":               upc_sel,
-                    # Fallback settings
                     "main_label_fallback":         fb1_sel,
                     "use_main_label_fallback":     use_fb1,
                     "main_label_fallback2":        fb2_sel,
                     "use_main_label_fallback2":    use_fb2,
-                    # Free-text
                     "tp_status":      tp_status,
                     "tp_date":        tp_date,
                     "product_status": prod_status,
@@ -1194,52 +1440,113 @@ def render_comparison_tab():
 
     st.session_state["label_selections"] = label_selections
 
-    quick_display_fields = [f for f in QUICK_SETTING_FIELDS if show_hangtag_rfid or f != "hangtag_rfid"]
+    # ── Pagination BELOW the last settings expander ────────────────────────────
+    render_pagination("label_map_page", lm_page, total_lm_pages, key_suffix="lm", show_page_text=True)
+
+    # FIX: Matched/unmatched info
+    _match_sig = str(sorted(bom_dict.keys())) + ":" + style_col + ":" + str(comp_df.shape)
+    if st.session_state.get("__match_hash") != _match_sig:
+        _bom_keys    = list(bom_dict.keys())
+        _excel_styles = comp_df[style_col].astype(str).str.strip().str.upper().unique()
+        _matched   = [s for s in _excel_styles if any(_styles_match(s, b) for b in _bom_keys)]
+        _unmatched = [s for s in _excel_styles if not any(_styles_match(s, b) for b in _bom_keys)]
+        st.session_state["__matched_styles"]   = _matched
+        st.session_state["__unmatched_styles"] = _unmatched
+        st.session_state["__match_hash"]       = _match_sig
+    if st.session_state.get("__matched_styles"):
+        render_info_banner(f"Matched styles: {', '.join(st.session_state['__matched_styles'])}")
+    if st.session_state.get("__unmatched_styles"):
+        render_warn_banner(f"No BOM found for style(s): {', '.join(st.session_state['__unmatched_styles'])} — upload the matching PDF(s)")
+
+    # ── Quick Look — Per Style Settings (always-visible cards, no open/close) ──
     render_divider()
-    st.markdown("""<div class="cx-meta">Quick Look - Per Style Settings</div>""", unsafe_allow_html=True)
-    for style_key in page_style_keys:
+    st.markdown("""<div class="cx-meta">Quick Look — Per Style Settings</div>""", unsafe_allow_html=True)
+
+    quick_display_fields = [f for f in QUICK_SETTING_FIELDS if show_hangtag_rfid or f != "hangtag_rfid"]
+
+    # Pagination — 10 per page, two columns, no view toggle needed here
+    CMP_PER_PAGE = 10
+    total_cmp_pages = max(1, -(-len(page_style_keys) // CMP_PER_PAGE))
+    cmp_page_key = "cmp_ql_page"
+    cmp_page = max(0, min(st.session_state.get(cmp_page_key, 0), total_cmp_pages - 1))
+    st.session_state[cmp_page_key] = cmp_page
+
+    cmp_page_style_keys = page_style_keys[cmp_page * CMP_PER_PAGE: (cmp_page + 1) * CMP_PER_PAGE]
+
+    # Two-column grid for the cards
+    ql_col_a, ql_col_b = st.columns(2, gap="medium")
+    ql_cols = [ql_col_a, ql_col_b]
+
+    for idx, style_key in enumerate(cmp_page_style_keys):
         picks = label_selections.get(style_key, {})
         style_colors = _colors_for_style(comp_df, style_col, color_col, style_key)
-        chips = []
-        if style_colors:
-            shown = ", ".join(style_colors[:10])
-            extra = f" (+{len(style_colors) - 10})" if len(style_colors) > 10 else ""
-            chips.append(f"<span class='cx-chip'>Colors ({len(style_colors)}): {shown}{extra}</span>")
-        else:
-            chips.append("<span class='cx-chip'>Colors (0): N/A</span>")
+        excel_match_count = int(comp_df[style_col].astype(str).str.strip().str.upper()
+                                .eq(style_key.strip().upper()).sum())
+        _, matched_bom = _find_matching_bom(style_key, bom_dict)
+        bom_loaded = matched_bom is not None
+        accent = "#3fd2a0" if bom_loaded else "#eb5b63"
+        bom_bg    = "#eaf9f0" if bom_loaded else "#ffeef0"
+        bom_bdr   = "#8fd9b3" if bom_loaded else "#f3a2aa"
+        bom_fg    = "#188d5a" if bom_loaded else "#b33844"
+        bom_label = "BOM Loaded" if bom_loaded else "No BOM"
+
+        # Infer material from first matched row
+        matched_rows = comp_df[comp_df[style_col].astype(str).str.strip().str.upper() == style_key.strip().upper()]
+        material_val = "N/A"
+        if not matched_rows.empty:
+            material_val = _infer_material_from_row(matched_rows.iloc[0], comp_df.columns)
+
+        def _chip(label, val, key=None):
+            v = str(val).strip() if val and str(val).strip() not in ("", "N/A", "nan", "None") else "N/A"
+            vc = "#1a2b45" if v != "N/A" else "#b0b8c8"
+            bg = "#f1f5f9" if v != "N/A" else "#f8fafc"
+            return (
+                f"<div style='display:inline-flex;flex-direction:column;padding:5px 9px;"
+                f"border-radius:7px;background:{bg};border:1px solid #e2e8f0;"
+                f"min-width:90px;margin-bottom:4px;'>"
+                f"<span style='font-size:0.57rem;color:#94a3b8;font-weight:700;"
+                f"letter-spacing:0.05em;text-transform:uppercase;white-space:nowrap;"
+                f"overflow:hidden;text-overflow:ellipsis;'>{escape(label)}</span>"
+                f"<span style='font-size:0.76rem;font-weight:600;color:{vc};"
+                f"margin-top:1px;word-break:break-word;'>{escape(v)}</span>"
+                f"</div>"
+            )
+
+        # Build all field chips
+        fields_html = ""
+        # ── Header info chips ──────────────────────────────────────────────
+        fields_html += _chip("Colors", str(len(style_colors)))
+        fields_html += _chip("Excel Rows", str(excel_match_count))
+        fields_html += _chip("Material", material_val)
+        # ── Settings chips — all QUICK_SETTING_FIELDS ──────────────────────
         for f in quick_display_fields:
-            val = str(picks.get(f, "N/A")).strip() or "N/A"
-            chips.append(f"<span class='cx-chip'>{QUICK_SETTING_LABELS[f]}: {val}</span>")
-        # Show active fallbacks in the quick look
-        fb_active = []
-        if picks.get("use_main_label_fallback"):
-            fb_active.append(f"FB1: {picks.get('main_label_fallback','N/A')}")
-        if picks.get("use_main_label_fallback2"):
-            fb_active.append(f"FB2: {picks.get('main_label_fallback2','N/A')}")
-        if picks.get("use_main_label_fallback") or picks.get("use_main_label_fallback2"):
-            fb_active.append("FB3: Colorway Name (auto)")
-        if fb_active:
-            chips.append(f"<span class='cx-chip'>Color Fallbacks: {' → '.join(fb_active)}</span>")
-        st.markdown(
-            f"""
-            <div class="cx-style-card">
-              <div class="cx-style-id">{style_key}</div>
-              <div class="cx-chip-row">{''.join(chips)}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+            fields_html += _chip(QUICK_SETTING_LABELS[f], picks.get(f, "N/A"))
+
+        card_html = (
+            f"<div style='border-left:4px solid {accent};border-radius:10px;"
+            f"padding:14px 16px 12px;background:#fff;"
+            f"box-shadow:0 1px 6px rgba(0,0,0,0.08);margin-bottom:10px;'>"
+            # Title row
+            f"<div style='display:flex;align-items:center;justify-content:space-between;"
+            f"margin-bottom:10px;'>"
+            f"<span style='font-size:1rem;font-weight:800;color:#1a2b45;"
+            f"letter-spacing:-0.01em;'>{escape(style_key)}</span>"
+            f"<span style='font-size:0.68rem;font-weight:700;padding:3px 10px;"
+            f"border-radius:999px;background:{bom_bg};border:1px solid {bom_bdr};"
+            f"color:{bom_fg};white-space:nowrap;'>{bom_label}</span>"
+            f"</div>"
+            # All chips
+            f"<div style='display:flex;flex-wrap:wrap;gap:5px;'>"
+            f"{fields_html}"
+            f"</div>"
+            f"</div>"
         )
 
-    renamed_preview = comp_df.rename(columns={style_col: "Buyer Style Number", color_col: "Color/Option"})
-    if "Buyer Style Number" in renamed_preview.columns:
-        excel_styles = renamed_preview["Buyer Style Number"].astype(str).str.strip().str.upper().unique()
-        matched   = [s for s in excel_styles if any(_styles_match(s, b) for b in bom_dict)]
-        unmatched = [s for s in excel_styles if s not in matched]
-        if matched:
-            render_info_banner(f"Matched styles: {', '.join(matched)}")
-        if unmatched:
-            render_warn_banner(f"No BOM found for style(s): {', '.join(unmatched)} \u2014 upload the matching PDF(s)")
+        with ql_cols[idx % 2]:
+            st.markdown(card_html, unsafe_allow_html=True)
 
+    # ── Pagination BELOW the card deck ─────────────────────────────────────────
+    render_pagination(cmp_page_key, cmp_page, total_cmp_pages, key_suffix="cmp_ql", show_page_text=True)
 
     render_divider()
     st.markdown("""<div class="cx-meta">Run Validation</div>""", unsafe_allow_html=True)
@@ -1254,12 +1561,7 @@ def render_comparison_tab():
             """,
             unsafe_allow_html=True,
         )
-        run_quick = st.button(
-            "\u25b6 Quick Trim (Planning)",
-            key="run_quick",
-            type="primary",
-            use_container_width=True,
-        )
+        run_quick = st.button("\u25b6 Quick Trim (Planning)", key="run_quick", type="primary", use_container_width=True)
     with run_col2:
         st.markdown(
             """
@@ -1270,12 +1572,7 @@ def render_comparison_tab():
             """,
             unsafe_allow_html=True,
         )
-        run_full = st.button(
-            "\u25b6 Trim (Purchasing)",
-            key="run_full",
-            type="primary",
-            use_container_width=True,
-        )
+        run_full = st.button("\u25b6 Trim (Purchasing)", key="run_full", type="primary", use_container_width=True)
 
     def _execute_validation(use_settings: bool):
         rename_map = {style_col: "Buyer Style Number", color_col: "Color/Option"}
@@ -1333,7 +1630,6 @@ def render_comparison_tab():
         if not show_hangtag_rfid:
             combined = combined.drop(columns=list(HANGTAG_RFID_OUTPUT_COLS), errors="ignore")
 
-        # Replace all blank / NaN cells with "N/A" so no output cell is ever empty
         _skip_fill_cols = {"Validation Status"}
         for _col in combined.columns:
             if _col in _skip_fill_cols:
@@ -1351,27 +1647,17 @@ def render_comparison_tab():
         st.session_state["validation_mode"]   = "Trim (Purchasing)" if use_settings else "Quick Trim (Planning)"
 
     if run_quick:
-        st.session_state["pending_validation_run"] = "quick"
-        st.rerun()
+        with st.spinner("Running Quick Trim (Planning)..."):
+            _execute_validation(use_settings=False)
+        st.session_state["post_validation_prompt"] = True
+        st.rerun(scope="app")
 
     if run_full:
-        st.session_state["pending_validation_run"] = "full"
-        st.rerun()
-
-    pending_mode = st.session_state.get("pending_validation_run")
-    if pending_mode:
-        show_validation_confirm_dialog(pending_mode)
-
-    execute_mode = st.session_state.pop("validation_to_execute", None)
-    if execute_mode:
-        if execute_mode == "full":
-            with st.spinner("Running Trim (Purchasing)..."):
-                _execute_validation(use_settings=True)
-        else:
-            with st.spinner("Running Quick Trim (Planning)..."):
-                _execute_validation(use_settings=False)
+        with st.spinner("Running Trim (Purchasing)..."):
+            _execute_validation(use_settings=True)
         st.session_state["post_validation_prompt"] = True
-        st.rerun()
+        st.rerun(scope="app")
+
 
 def render_results():
     if "validation_result" not in st.session_state:
@@ -1379,7 +1665,15 @@ def render_results():
         return
     res  = st.session_state["validation_result"]
     mode = st.session_state.get("validation_mode", "")
-    xls = export_to_excel(result_df=res, original_df=st.session_state.get("comparison_raw", pd.DataFrame()))
+
+    _xls_hash = str(id(res)) + str(res.shape)
+    if st.session_state.get("__xls_hash") != _xls_hash:
+        st.session_state["__xls_cache"] = export_to_excel(
+            result_df=res,
+            original_df=st.session_state.get("comparison_raw", pd.DataFrame())
+        )
+        st.session_state["__xls_hash"] = _xls_hash
+    xls = st.session_state["__xls_cache"]
     st.markdown(
         "<div class='cx-results-title-wrap'><h2 class='cx-title'>Results & Export</h2></div>",
         unsafe_allow_html=True,
@@ -1396,49 +1690,85 @@ def render_results():
         )
     else:
         st.markdown("""<div class="cx-meta cx-meta-compact">Validation Summary</div>""", unsafe_allow_html=True)
+
     status_counts = res["Validation Status"].value_counts(dropna=False).to_dict() if "Validation Status" in res.columns else {}
     ok      = status_counts.get("\u2705 Validated", 0)
     partial = status_counts.get("\u26a0\ufe0f Partial", 0)
     err     = sum(v for k, v in status_counts.items() if str(k).startswith("\u274c"))
     render_validation_summary(ok, partial, err, len(res))
     render_validation_progress(ok, partial, err, len(res))
-    label_selections = st.session_state.get("label_selections", {})
+
+    label_selections  = st.session_state.get("label_selections", {})
     show_hangtag_rfid = bool(st.session_state.get("show_hangtag_rfid", False))
-    quick_display_fields = [f for f in QUICK_SETTING_FIELDS if show_hangtag_rfid or f != "hangtag_rfid"]
+
+    # FIX 1: View toggle — does NOT close open styles
     res_view_mode = render_view_toggle(
         "results_view_mode",
         default="Grid",
         label="",
-        clear_state_keys=["inspect_popup_style"],
+        clear_state_keys=None,  # FIX: don't clear selected style
     )
-    res_col_count = 1 if res_view_mode == "List" else (3 if res_view_mode == "Tile" else 2)
-    res_cols = st.columns(res_col_count)
+
     style_col_name = "Buyer Style Number" if "Buyer Style Number" in res.columns else None
     color_col_name = "Color/Option" if "Color/Option" in res.columns else None
 
-    style_groups = []
-    if style_col_name:
-        for style_key, grp in res.groupby(style_col_name, sort=False):
-            g = grp.copy()
-            c_ok, c_partial, c_err = _status_counts(g)
-            total_colors = int(len(g[color_col_name].dropna().astype(str).unique())) if color_col_name and color_col_name in g.columns else int(len(g))
-            style_groups.append((str(style_key), g, c_ok, c_partial, c_err, total_colors))
+    _sg_cache_key = "__style_groups_cache"
+    _sg_hash_key  = "__style_groups_hash"
+    _res_hash = str(len(res)) + str(list(res.columns)) + str(res.shape)
+    if st.session_state.get(_sg_hash_key) != _res_hash or _sg_cache_key not in st.session_state:
+        style_groups = []
+        if style_col_name:
+            for style_key, grp in res.groupby(style_col_name, sort=False):
+                g = grp.copy()
+                c_ok, c_partial, c_err = _status_counts(g)
+                total_colors = int(len(g[color_col_name].dropna().astype(str).unique())) if color_col_name and color_col_name in g.columns else int(len(g))
+                style_groups.append((str(style_key), g, c_ok, c_partial, c_err, total_colors))
+        else:
+            c_ok, c_partial, c_err = _status_counts(res)
+            style_groups.append(("N/A", res.copy(), c_ok, c_partial, c_err, int(len(res))))
+        st.session_state[_sg_cache_key] = style_groups
+        st.session_state[_sg_hash_key]  = _res_hash
     else:
-        c_ok, c_partial, c_err = _status_counts(res)
-        style_groups.append(("N/A", res.copy(), c_ok, c_partial, c_err, int(len(res))))
+        style_groups = st.session_state[_sg_cache_key]
+
+    total_result_styles = len(style_groups)
+
+    per_page = RESULTS_PER_PAGE_LIST if res_view_mode == "List" else (RESULTS_PER_PAGE_TILE if res_view_mode == "Tile" else RESULTS_PER_PAGE_GRID)
+    total_res_pages = max(1, -(-total_result_styles // per_page))
+
+    res_page_key = "results_page"
+    res_page = max(0, min(st.session_state.get(res_page_key, 0), total_res_pages - 1))
+    st.session_state[res_page_key] = res_page
+
+    page_style_groups = style_groups[res_page * per_page: (res_page + 1) * per_page]
+
+    # ── FIX 4 (restored): column count follows view mode ──────────────────────
+    res_col_count = 1 if res_view_mode == "List" else (3 if res_view_mode == "Tile" else 2)
+    res_cols = st.columns(res_col_count)
 
     if "results_selected_style" not in st.session_state:
         st.session_state["results_selected_style"] = None
 
     selected_style = st.session_state.get("results_selected_style")
-    for idx, (style_key, g, c_ok, c_partial, c_err, total_colors) in enumerate(style_groups):
+
+    for idx, (style_key, g, c_ok, c_partial, c_err, total_colors) in enumerate(page_style_groups):
+        # Global index for numbering
+        global_idx = res_page * per_page + idx + 1
         accent = "#eb5b63" if c_err > 0 else ("#f0b429" if c_partial > 0 else "#3fd2a0")
+        is_open = selected_style == style_key
+
         with res_cols[idx % res_col_count]:
-            card_class = "cx-list-row" if res_view_mode == "List" else "cx-style-card"
+            if res_view_mode == "List":
+                card_class = "cx-list-row"
+                number_badge = f"<span class='cx-index-badge'>{global_idx}</span>"
+            else:
+                card_class = "cx-style-card"
+                number_badge = f"<span style='font-size:0.7rem;color:#9aabbd;font-weight:600;margin-right:6px;'>#{global_idx}</span>"
+
             st.markdown(
                 f"""
                 <div class="{card_class}" style="border-left-color:{accent};">
-                  <div class="cx-style-id">{style_key}</div>
+                  <div class="cx-style-id cx-style-id-row">{number_badge}<span>{style_key}</span></div>
                   <div class="cx-chip-row">
                     <span class="cx-chip">No. Colors: {total_colors}</span>
                     <span class="cx-chip">Validated: {c_ok}</span>
@@ -1449,17 +1779,17 @@ def render_results():
                 """,
                 unsafe_allow_html=True,
             )
-            is_open = selected_style == style_key
             button_label = "Close style" if is_open else "Open style"
             if st.button(button_label, key=f"open_style_{style_key}", type="tertiary", use_container_width=True):
                 st.session_state["results_selected_style"] = None if is_open else style_key
                 st.rerun()
 
+    # ── Open style detail — render below card grid ─────────────────────────────
     selected_style = st.session_state.get("results_selected_style")
-    selected_group = next((x for x in style_groups if x[0] == selected_style), None)
+    selected_group = next((x for x in page_style_groups if x[0] == selected_style), None)
     if selected_group is not None:
         style_key, g, _, _, _, _ = selected_group
-        st.markdown(f"""<div class="cx-meta">Style Details - {style_key}</div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div class="cx-meta" style="margin-top:1rem;">Style Details — {style_key}</div>""", unsafe_allow_html=True)
         picks = label_selections.get(style_key, {})
         if not picks:
             style_upper = style_key.strip().upper()
@@ -1468,29 +1798,118 @@ def render_results():
                 if style_upper == ku or style_upper in ku or ku in style_upper:
                     picks = v
                     break
-        for _, row in g.iterrows():
-            color_val = str(row.get(color_col_name, "N/A")) if color_col_name else "N/A"
-            material_val = _infer_material_from_row(row, res.columns)
-            status_raw = str(row.get("Validation Status", "Parsed"))
-            _, _, _, label = _status_style(status_raw)
-            accent = _status_accent_color(label)
-            chips = [
-                f"<span class='cx-chip'>Style: {style_key}</span>",
-                f"<span class='cx-chip'>Color: {color_val}</span>",
-                f"<span class='cx-chip'>Material: {material_val}</span>",
-            ]
-            for f in quick_display_fields:
-                val = str(picks.get(f, "N/A")).strip() or "N/A"
-                chips.append(f"<span class='cx-chip'>{QUICK_SETTING_LABELS[f]}: {val}</span>")
-            st.markdown(
-                f"""
-                <div class="cx-style-card" style="border-left-color:{accent};">
-                  <div class="cx-style-name">{color_val}</div>
-                  <div class="cx-chip-row">{''.join(chips)}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
+
+        detail_col_count = 1 if res_view_mode == "List" else (3 if res_view_mode == "Tile" else 2)
+
+        # ── Restored original detail card builder (inline) ────────────────────
+        _DETAIL_GROUPS_LOCAL = [
+            ("Label",   [
+                ("Main Label",          "Main Label"),
+                ("Main Label Color",    "Main Label Color"),
+                ("Main Label Supplier", "Main Label Supplier"),
+                ("Care Label",          "Care Label"),
+                ("Care Label Color",    "Care Label Color"),
+                ("Care Supplier",       "Care Supplier"),
+            ]),
+            ("Hangtag", [
+                ("Hangtag",             "Hangtag"),
+                ("Hangtag Supplier",    "Hangtag Supplier"),
+                ("Hangtag 2",           "Hangtag 2"),
+                ("Hangtag 3",           "Hangtag3"),
+                ("RFID w/o MSRP",       "RFID w/o MSRP"),
+                ("RFID w/o MSRP Sup",   "RFID w/o MSRP Supplier"),
+            ]),
+            ("Sticker", [
+                ("RFID Sticker",        "RFID Stickers"),
+                ("RFID Sticker Sup",    "RFID Stickers Supplier"),
+                ("UPC Bag Sticker",     "UPC Bag Sticker (Polybag)"),
+                ("UPC Supplier",        "UPC Supplier"),
+            ]),
+            ("Content", [
+                ("Content Code",        "Content Code"),
+                ("TP FC",               "TP FC"),
+                ("Care Code",           "Care Code"),
+            ]),
+        ]
+
+        def _fv(row, col):
+            v = str(row.get(col, "")).strip()
+            return v if v and v.lower() not in ("nan", "none", "") else "N/A"
+
+        def _vc(v):
+            return "#b0b8c8" if v == "N/A" else "#1a2b45"
+
+        def _build_detail_card(row, card_class, accent, color_val, material_val, status_raw, res_cols_local):
+            if "✅" in status_raw:
+                sbg, sfg = "#d1fae5", "#065f46"
+            elif "⚠️" in status_raw:
+                sbg, sfg = "#fef9c3", "#854d0e"
+            else:
+                sbg, sfg = "#fee2e2", "#991b1b"
+
+            html = (
+                f"<div class='{card_class}' style='border-top:3px solid {accent};border-radius:10px;"
+                f"padding:14px 16px 10px;margin-bottom:10px;background:#fff;"
+                f"box-shadow:0 1px 4px rgba(0,0,0,0.07);'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;'>"
+                f"<div style='font-size:1rem;font-weight:700;color:#1a2b45;'>{escape(color_val)}</div>"
+                f"<span style='font-size:0.7rem;font-weight:700;padding:3px 10px;border-radius:999px;"
+                f"background:{sbg};color:{sfg};'>{escape(status_raw)}</span>"
+                f"</div>"
+                f"<div style='font-size:0.75rem;color:#6b7a99;margin-bottom:10px;'>"
+                f"<span style='font-weight:600;color:#4a5568;'>Material:</span> {escape(material_val)}</div>"
             )
+
+            for grp_label, fields in _DETAIL_GROUPS_LOCAL:
+                avail = [(lbl, col) for lbl, col in fields if col in res_cols_local]
+                if not avail:
+                    continue
+                vals = [(lbl, _fv(row, col)) for lbl, col in avail]
+                if not any(v != "N/A" for _, v in vals):
+                    continue
+                html += (
+                    f"<div style='margin-bottom:8px;'>"
+                    f"<div style='font-size:0.62rem;font-weight:800;letter-spacing:0.08em;"
+                    f"text-transform:uppercase;color:#94a3b8;margin-bottom:4px;'>{grp_label}</div>"
+                    f"<div style='display:flex;flex-wrap:wrap;gap:4px;'>"
+                )
+                for lbl, v in vals:
+                    bg = "#f1f5f9" if v != "N/A" else "#f8fafc"
+                    html += (
+                        f"<div style='display:inline-flex;flex-direction:column;padding:4px 8px;"
+                        f"border-radius:6px;background:{bg};border:1px solid #e2e8f0;min-width:80px;'>"
+                        f"<span style='font-size:0.58rem;color:#94a3b8;font-weight:600;"
+                        f"letter-spacing:0.04em;text-transform:uppercase;'>{escape(lbl)}</span>"
+                        f"<span style='font-size:0.75rem;font-weight:600;color:{_vc(v)};"
+                        f"margin-top:1px;word-break:break-word;'>{escape(v)}</span>"
+                        f"</div>"
+                    )
+                html += "</div></div>"
+            html += "</div>"
+            return html
+
+        col_html = [""] * detail_col_count
+        res_cols_set = set(res.columns)
+        for d_idx, (_, row) in enumerate(g.iterrows()):
+            color_val    = str(row.get(color_col_name, "N/A")) if color_col_name else "N/A"
+            material_val = _infer_material_from_row(row, res.columns)
+            status_raw   = str(row.get("Validation Status", "Parsed"))
+            _, _, _, lbl  = _status_style(status_raw)
+            accent_d = _status_accent_color(lbl)
+            card_class_d = "cx-list-row" if res_view_mode == "List" else "cx-style-card"
+            col_html[d_idx % detail_col_count] += _build_detail_card(
+                row, card_class_d, accent_d, color_val, material_val, status_raw, res_cols_set
+            )
+
+        detail_cols = st.columns(detail_col_count)
+        for ci, html in enumerate(col_html):
+            if html:
+                with detail_cols[ci]:
+                    st.markdown(html, unsafe_allow_html=True)
+
+    # ── Pagination BELOW the per-style card deck ───────────────────────────────
+    render_pagination(res_page_key, res_page, total_res_pages, key_suffix="res", show_page_text=True)
+
     with st.container(key="results_actions_bottom"):
         c_csv, c_xls = st.columns([1, 1], gap="small")
         with c_csv:
