@@ -31,8 +31,44 @@ _GLOVE_COLUMNS = {
     "Content Code -Gloves", "TP FC - Gloves", "Care Code-Gloves",
 }
 
+# ── Supplier alias normalization ──────────────────────────────────────────────
+# "Bao Shen" and "Bao Shen (Apparel)" → "PT BSN"
+_SUPPLIER_ALIASES: list[tuple[str, str]] = [
+    ("bao shen", "PT BSN"),
+]
+
+
+def _normalize_supplier_alias(value: str) -> str:
+    """Replace known supplier aliases in any cell value."""
+    if not value or not isinstance(value, str):
+        return value
+    vl = value.lower()
+    for fragment, canonical in _SUPPLIER_ALIASES:
+        if fragment in vl:
+            return canonical
+    return value
+
+
+def _apply_supplier_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply supplier alias normalization to every cell in the DataFrame.
+    Runs once before writing to Excel so both sheets are clean.
+    """
+    df = df.copy()
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].apply(
+                lambda v: _normalize_supplier_alias(str(v)) if pd.notna(v) else v
+            )
+    return df
+
 
 def export_to_excel(result_df: pd.DataFrame, original_df: pd.DataFrame) -> bytes:
+    # Apply alias normalization before writing
+    result_df   = _apply_supplier_aliases(result_df)
+    if original_df is not None and not original_df.empty:
+        original_df = _apply_supplier_aliases(original_df)
+
     buffer = io.BytesIO()
 
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
@@ -40,20 +76,29 @@ def export_to_excel(result_df: pd.DataFrame, original_df: pd.DataFrame) -> bytes
         if original_df is not None and not original_df.empty:
             original_df.to_excel(writer, index=False, sheet_name="Original")
 
-        wb  = writer.book
-        ws  = writer.sheets["Validated BOM"]
+        wb   = writer.book
+        ws   = writer.sheets["Validated BOM"]
         cols = list(result_df.columns)
 
+        # ── Shared base properties ─────────────────────────────────────────
+        _base_header = {"bold": True, "border": 1, "text_wrap": True,
+                        "align": "center", "valign": "vcenter"}
+        _base_cell   = {"border": 1, "align": "center", "valign": "vcenter"}
+
         # ── Formats ────────────────────────────────────────────────────────
-        fmt_header       = wb.add_format({"bold": True, "bg_color": "#D9D9D9", "border": 1, "text_wrap": True})
-        fmt_new_header   = wb.add_format({"bold": True, "bg_color": "#BDD7EE", "border": 1, "text_wrap": True})
-        fmt_glove_header = wb.add_format({"bold": True, "bg_color": "#E2EFDA", "border": 1, "text_wrap": True})
-        fmt_new_cell     = wb.add_format({"bg_color": "#DEEAF1", "border": 1})
-        fmt_glove_cell   = wb.add_format({"bg_color": "#EBF5E1", "border": 1})
-        fmt_validated    = wb.add_format({"bg_color": "#C6EFCE", "font_color": "#276221", "border": 1})
-        fmt_partial      = wb.add_format({"bg_color": "#FFEB9C", "font_color": "#9C5700", "border": 1})
-        fmt_error        = wb.add_format({"bg_color": "#FFC7CE", "font_color": "#9C0006", "border": 1})
-        fmt_default      = wb.add_format({"border": 1})
+        fmt_header       = wb.add_format({**_base_header, "bg_color": "#D9D9D9"})
+        fmt_new_header   = wb.add_format({**_base_header, "bg_color": "#BDD7EE"})
+        fmt_glove_header = wb.add_format({**_base_header, "bg_color": "#E2EFDA"})
+
+        fmt_new_cell     = wb.add_format({**_base_cell, "bg_color": "#DEEAF1"})
+        fmt_glove_cell   = wb.add_format({**_base_cell, "bg_color": "#EBF5E1"})
+        fmt_validated    = wb.add_format({**_base_cell, "bg_color": "#C6EFCE",
+                                          "font_color": "#276221"})
+        fmt_partial      = wb.add_format({**_base_cell, "bg_color": "#FFEB9C",
+                                          "font_color": "#9C5700"})
+        fmt_error        = wb.add_format({**_base_cell, "bg_color": "#FFC7CE",
+                                          "font_color": "#9C0006"})
+        fmt_default      = wb.add_format({**_base_cell})
 
         # ── Header row ─────────────────────────────────────────────────────
         for col_idx, col_name in enumerate(cols):
@@ -101,4 +146,37 @@ def export_to_excel(result_df: pd.DataFrame, original_df: pd.DataFrame) -> bytes
         # ── Freeze top row ─────────────────────────────────────────────────
         ws.freeze_panes(1, 0)
 
+        # ── Apply centering to Original sheet too if present ───────────────
+        if original_df is not None and not original_df.empty and "Original" in writer.sheets:
+            ws_orig      = writer.sheets["Original"]
+            orig_cols    = list(original_df.columns)
+            fmt_orig_hdr = wb.add_format({**_base_header, "bg_color": "#D9D9D9"})
+            fmt_orig_cell = wb.add_format({**_base_cell})
+
+            for col_idx, col_name in enumerate(orig_cols):
+                ws_orig.write(0, col_idx, col_name, fmt_orig_hdr)
+
+            for row_idx, (_, row) in enumerate(original_df.iterrows()):
+                for col_idx, col_name in enumerate(orig_cols):
+                    val = row[col_name]
+                    val = "" if pd.isna(val) else val
+                    ws_orig.write(row_idx + 1, col_idx, val, fmt_orig_cell)
+
+            for col_idx, col_name in enumerate(orig_cols):
+                max_len = max(
+                    len(str(col_name)),
+                    original_df[col_name].astype(str).map(len).max() if not original_df.empty else 0,
+                )
+                ws_orig.set_column(col_idx, col_idx, min(max_len + 2, 50))
+
+            ws_orig.freeze_panes(1, 0)
+
     return buffer.getvalue()
+
+
+def export_to_csv(df: pd.DataFrame) -> bytes:
+    # Apply alias normalization to CSV export too
+    df = _apply_supplier_aliases(df)
+    buffer = io.StringIO()
+    df.to_csv(buffer, index=False)
+    return buffer.getvalue().encode("utf-8")
