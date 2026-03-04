@@ -164,7 +164,6 @@ def _get_material_code_for_comp(comp: dict) -> str:
         found = extract_material_code(desc)
         if found:
             return found
-    # If ALL colorway values are the same numeric code, treat as material code
     cw_vals = [str(v).strip() for v in comp.get("colorways", {}).values()]
     numeric_vals = [v for v in cw_vals if re.match(r'^\d{5,7}$', v)]
     if numeric_vals and len(set(numeric_vals)) == 1:
@@ -298,6 +297,55 @@ def _find_code_in_costing_by_desc(costing_df, *keywords) -> str:
             m = re.search(r'\b(\d{5,7})\b', str(row.get(desc_col, "")))
             if m:
                 return m.group(1)
+    return ""
+
+
+def _find_code_in_costing_fuzzy(costing_df, *keyword_groups) -> str:
+    """
+    BUG 1 FIX — Fuzzy costing search for 'Hangtag Package Part' and similar rows
+    whose description wording varies across PDF sources.
+
+    Each positional arg is tried in order until a code is found:
+      - str  → all words in the string must appear in the description (AND logic)
+      - list → any element of the list must fully match (OR logic)
+
+    Examples of description variants found in real PDFs:
+      "Hangtag Package Part"  "Hangtag Pkg Part"  "HT Package Part"
+      "Hangtag Pack Part"     "Hang Tag Package"  "Package Hangtag"
+
+    The original _find_code_in_costing_by_desc("hangtag package part") only
+    matched the exact phrase, leaving 97305 (RFID Tag) as the fallback for 7+
+    styles that store their 121612/123130 code only in costing_detail.
+    """
+    if costing_df is None or costing_df.empty:
+        return ""
+
+    desc_col = None
+    for col in costing_df.columns:
+        cl = str(col).lower()
+        if "description" in cl or "desc" in cl:
+            desc_col = col
+            break
+    if not desc_col:
+        desc_col = costing_df.columns[0]
+
+    def _row_matches_group(desc: str, group) -> bool:
+        if isinstance(group, str):
+            return all(w in desc for w in group.lower().split())
+        # list / tuple — any element fully matches
+        return any(all(w in desc for w in str(g).lower().split()) for g in group)
+
+    for group in keyword_groups:
+        for _, row in costing_df.iterrows():
+            desc = str(row.get(desc_col, "")).lower()
+            if _row_matches_group(desc, group):
+                for col in costing_df.columns:
+                    candidate = str(row.get(col, "")).strip()
+                    if re.match(r'^\d{5,7}$', candidate):
+                        return candidate
+                m = re.search(r'\b(\d{5,7})\b', str(row.get(desc_col, "")))
+                if m:
+                    return m.group(1)
     return ""
 
 
@@ -603,7 +651,6 @@ def validate_and_fill(
             lookup_name = component_name.split(" - ")[0].strip() if " - " in component_name else component_name
             lookup_lower = lookup_name.strip().lower()
 
-            # Strict match first: exact → startswith → loose with bad-color guard
             def _strict_match(v):
                 raw = str(v).split(" - ")[0].strip() if " - " in str(v) else str(v)
                 raw_lower = raw.strip().lower()
@@ -684,17 +731,42 @@ def validate_and_fill(
         return _nv(e.get(key, ""))
 
     def get_content(key, matched_cw, cw_num, raw=""):
+        """
+        BUG 4/5 FIX + TP FC FIX:
+        Look up content code/shell for the given colorway.
+
+        Priority order:
+          1. Exact matched_cw key (e.g. "262-Canoe, Mountains")
+          2. 3-digit cw_num extracted from matched_cw or raw color string
+          3. Stripped cw_num (leading zeros removed)
+          4. 3-digit prefix extracted from raw color string
+          5. __default__ — only present when the whole BOM has ONE content section
+
+        The __default__ key is set by extract_content_codes only for single-section
+        BOMs, so multi-section BOMs (different compositions per colorway) will
+        return "" (→ "N/A") for unknown colorways rather than silently using the
+        wrong section's data.
+
+        Leading/trailing whitespace in content_code values is stripped to fix
+        cases where the PDF parser emits " SR1" or " O1X" instead of "SR1"/"O1X".
+        """
         raw_prefix = _extract_num_prefix(raw)
         cw_num_stripped = cw_num.lstrip("0") or cw_num
+
         e = (
             content_codes.get(matched_cw)
             or content_codes.get(cw_num)
             or content_codes.get(cw_num_stripped)
             or (content_codes.get(raw_prefix) if raw_prefix else None)
-            or content_codes.get("__default__")
+            or content_codes.get("__default__")   # only present for single-section BOMs
             or {}
         )
-        return _nv(e.get(key, ""))
+        val = e.get(key, "")
+        # Strip stray leading/trailing whitespace that PDF extraction sometimes
+        # introduces (e.g. " SR1" → "SR1", " O1X" → "O1X")
+        if isinstance(val, str):
+            val = val.strip()
+        return _nv(val)
 
     def split_comp(sel: str):
         if sel and " - " in str(sel):
@@ -825,12 +897,41 @@ def validate_and_fill(
             if _found:
                 raw_care = _found
 
+        # ── RFID Sticker auto-detect ─────────────────────────────────────────
+        # ROOT CAUSE FIX:
+        # "Hangtag Package Part" in the Color BOM = 097305 (the physical hangtag).
+        # The RFID Sticker (121612 / 123130) is a DIFFERENT costing_detail row
+        # described as "RFID Sticker", "RFID Tag", "Hangtag RFID Sticker", etc.
+        #
+        # Previous code searched costing for "hangtag package part" and extracted
+        # whichever code it found first — which was 097305, not 121612.
+        #
+        # Fix: search costing_detail for rows whose description contains "rfid".
+        # This reliably finds 121612/123130 without conflating them with the hangtag.
         if not raw_rfid_sticker:
-            _auto = _auto_comp_with_code(
-                ["hangtag package part", "rfid sticker", "rfid tag", "rfid label"]
-            )
-            if _auto:
-                raw_rfid_sticker = _auto
+            # Step 1: scan costing for any row described as "rfid ..."
+            _rfid_code_from_costing = _find_code_in_costing_by_desc(costing_detail, "rfid")
+            if _rfid_code_from_costing:
+                raw_rfid_sticker = f"RFID Sticker - {_rfid_code_from_costing}"
+            else:
+                # Step 2: scan costing for known RFID codes (121612, 123130) anywhere
+                _RFID_KNOWN = ("121612", "123130")
+                for _, _crow in (costing_detail.iterrows() if costing_detail is not None and not costing_detail.empty else []):
+                    for _col in costing_detail.columns:
+                        _cand = str(_crow.get(_col, "")).strip()
+                        if _cand in _RFID_KNOWN:
+                            raw_rfid_sticker = f"RFID Sticker - {_cand}"
+                            break
+                    if raw_rfid_sticker:
+                        break
+            if not raw_rfid_sticker:
+                # Step 3: fall back to color BOM components that mention "rfid"
+                _auto_rfid = _auto_comp_with_code(
+                    ["rfid sticker", "rfid tag", "rfid label"]
+                )
+                if _auto_rfid:
+                    raw_rfid_sticker = _auto_rfid
+
 
         if not raw_upc:
             _auto = _auto_comp_with_code(
@@ -928,19 +1029,20 @@ def validate_and_fill(
             )
         rfid_supplier = resolve_supplier(rfid_code) if rfid_code else resolve_supplier(ht_code)
 
-        # ── RFID Sticker ──────────────────────────────────────────────────────
+        # ── RFID Sticker code resolution ─────────────────────────────────────
         rfid_sticker_code = ""
         if raw_rfid_sticker:
             rfid_sticker_code = _resolve_settings_code(
-                raw_rfid_sticker, "rfid sticker", "rfid tag", "hangtag package"
+                raw_rfid_sticker, "rfid sticker", "rfid tag"
+                # NOTE: "hangtag package" intentionally removed — that row holds
+                # 097305 (the physical hangtag), not the RFID sticker code.
             )
         if not rfid_sticker_code:
-            rfid_sticker_code = _find_code_in_costing_by_desc(costing_detail, "hangtag package")
-        if not rfid_sticker_code:
+            # Search costing for any row described as "rfid" — finds 121612/123130
             rfid_sticker_code = _find_code_in_costing_by_desc(costing_detail, "rfid")
         if not rfid_sticker_code:
             rfid_sticker_code = _scan_costing_for_component(
-                costing_detail, "hangtag package part", "rfid sticker", "rfid tag"
+                costing_detail, "rfid sticker", "rfid tag", "rfid label"
             )
         if not rfid_sticker_code:
             rfid_sticker_code = rfid_code

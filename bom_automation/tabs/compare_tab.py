@@ -56,8 +56,12 @@ def _get_components_for_bom(bom_data):
                         if _re.match(r'^\d{5,7}$', cv):
                             code = cv
                             break
-            # FIX: if still no code, scan costing_detail for this component name.
-            # "Hangtag Package Part" stores its code (121612/123130) only in costing.
+            # BUG 1 FIX (part A): if still no code, scan costing_detail for this
+            # component name.  "Hangtag Package Part" stores its code (121612/123130)
+            # only in costing_detail, not in the color BOM component cells.
+            # Without this, 'Hangtag Package Part' appears in the components list
+            # without a code, so _pick_option's search for '121612' fails and it
+            # falls through to 'rfid tag' (97305).
             if not code and cd_enrich is not None and not cd_enrich.empty:
                 desc_col_c = next(
                     (c for c in cd_enrich.columns if "desc" in str(c).lower()),
@@ -74,6 +78,15 @@ def _get_components_for_bom(bom_data):
                                 break
                     if code:
                         break
+                # Also try inline code in description string (e.g. "Hangtag Package Part 121612")
+                if not code:
+                    for _, crow in cd_enrich.iterrows():
+                        row_desc = str(crow.get(desc_col_c, "")).strip()
+                        if name_lower in row_desc.lower():
+                            m = _re.search(r'\b(\d{5,7})\b', row_desc)
+                            if m:
+                                code = m.group(1)
+                                break
             label = f"{name} - {code}" if code else name
             norm  = name.strip().lower()
             if norm not in seen_names:
@@ -91,16 +104,14 @@ def _get_components_for_bom(bom_data):
                 seen_names.add(norm)
                 components.append(val)
 
-    # ── 3. FIX: Costing detail — adds packaging/sticker components (e.g. Packaging 3 - 980010)
-    #    that are NOT in the color BOM but ARE used for UPC/RFID sticker fields.
+    # ── 3. Costing detail — adds packaging/sticker components not in color BOM ──
+    #    e.g. "Packaging 3 - 980010" used for UPC sticker field.
     cd = bom_data.get("costing_detail")
     if cd is not None and not cd.empty:
-        # Find description column
         desc_col = next(
             (c for c in cd.columns if "desc" in str(c).lower()),
             cd.columns[0] if len(cd.columns) > 0 else None,
         )
-        # Find material/code column
         mat_col = next(
             (c for c in cd.columns
              if str(c).lower() in ("material", "material code", "mat code", "mat")),
@@ -112,10 +123,8 @@ def _get_components_for_bom(bom_data):
                 norm = desc.lower()
                 if not desc or norm in ("none", "nan", "") or norm in seen_names:
                     continue
-                # Extract numeric material code
                 code = str(crow.get(mat_col, "")).strip() if mat_col else ""
                 if not code or not _re.match(r'^\d+$', code):
-                    # Try to find code in any cell of this row
                     for col in cd.columns:
                         candidate = str(crow.get(col, "")).strip()
                         if _re.match(r'^\d{5,7}$', candidate):
@@ -128,7 +137,58 @@ def _get_components_for_bom(bom_data):
                 label = f"{desc} - {code}" if code else desc
                 components.append(label)
 
+    # ── 4. RFID Sticker explicit injection ────────────────────────────────────
+    # ROOT CAUSE FIX: The "Hangtag Package Part" row in the Color BOM stores
+    # code 097305 (the physical hangtag), NOT the RFID Sticker (121612/123130).
+    # The RFID Sticker is a separate costing_detail row described as
+    # "RFID Sticker", "RFID Tag", "Hangtag RFID Sticker", etc.
+    #
+    # Problem: _pick_option("hangtag package part") previously found the
+    # "Hangtag Package Part - 97305" component and used 97305 as the RFID
+    # sticker code — completely wrong.
+    #
+    # Fix: explicitly scan costing_detail for RFID rows and inject them as
+    # named "RFID Sticker - CODE" components so _pick_option("rfid sticker")
+    # and _pick_option("121612") / _pick_option("123130") reliably find them.
+    _RFID_CODES_PRIORITY = ("121612", "123130")
+    _rfid_injected = set()
+    if cd is not None and not cd.empty:
+        desc_col_rfid = next(
+            (c for c in cd.columns if "desc" in str(c).lower()),
+            cd.columns[0] if len(cd.columns) > 0 else None,
+        )
+        if desc_col_rfid:
+            # Pass 1: look for rows whose description contains "rfid"
+            for _, crow in cd.iterrows():
+                desc = str(crow.get(desc_col_rfid, "")).strip()
+                if "rfid" not in desc.lower():
+                    continue
+                code = ""
+                for col in cd.columns:
+                    candidate = str(crow.get(col, "")).strip()
+                    if _re.match(r'^\d{5,7}$', candidate):
+                        code = candidate
+                        break
+                if code and code not in _rfid_injected:
+                    label = f"RFID Sticker - {code}"
+                    if label not in components:
+                        components.append(label)
+                    _rfid_injected.add(code)
+
+            # Pass 2: if known RFID codes (121612/123130) appear anywhere in
+            # costing but weren't caught by the "rfid" description scan
+            # (some PDFs may label the row differently), inject them explicitly.
+            for _, crow in cd.iterrows():
+                for col in cd.columns:
+                    candidate = str(crow.get(col, "")).strip()
+                    if candidate in _RFID_CODES_PRIORITY and candidate not in _rfid_injected:
+                        label = f"RFID Sticker - {candidate}"
+                        if label not in components:
+                            components.append(label)
+                        _rfid_injected.add(candidate)
+
     return components
+
 
 
 def _read_comparison_file(file):
@@ -303,7 +363,6 @@ def render_comparison_tab():
     for style_key in page_style_keys:
         bom_data_s = bom_dict[style_key]
         _comp_cache = st.session_state.setdefault("_comp_cache", {})
-        # Invalidate cache entry if bom_data changed (e.g. after re-upload)
         _bom_sig = id(bom_data_s)
         _cache_sig_key = f"_comp_cache_sig_{style_key}"
         if st.session_state.get(_cache_sig_key) != _bom_sig or style_key not in _comp_cache:
@@ -443,18 +502,44 @@ def render_comparison_tab():
                 else:
                     rfid_sel = "N/A"
                 with r4c:
-                    # FIX: also search by component name keywords, not just code numbers
+                    # BUG 1 FIX (part B): Reorder _pick_option keywords so that
+                    # 'hangtag package part' is searched FIRST by component name,
+                    # then by code numbers (121612, 123130), and only as a last
+                    # resort by 'rfid tag'/'rfid sticker'.
+                    #
+                    # Original order: 123130, 121612, rfid sticker, rfid tag, hangtag package part
+                    # Problem: '121612' only matches if the component LABEL contains the string
+                    # '121612'.  If the component was not resolved with a code (e.g. listed as
+                    # bare 'Hangtag Package Part' without the code suffix), the code searches
+                    # miss and 'rfid tag' hits -> 97305 selected instead of 121612.
+                    #
+                    # Fix: search 'hangtag package part' by name FIRST.  After the BUG 1 part-A
+                    # fix in _get_components_for_bom, 'Hangtag Package Part - 121612' will be
+                    # in na_opts, so this search now succeeds.
+                    # ROOT CAUSE FIX (RFID Sticker):
+                    # "Hangtag Package Part" in the Color BOM holds code 097305
+                    # (the physical hangtag), NOT the RFID Sticker (121612/123130).
+                    # Searching by "hangtag package part" therefore auto-selects the
+                    # wrong component. The RFID Sticker is a separate costing row
+                    # described as "RFID Sticker", "RFID Tag", or similar.
+                    # Fix: search by the known RFID codes (121612, 123130) first,
+                    # then by "rfid sticker"/"rfid tag" component name.
+                    # "hangtag package part" is intentionally removed from this list.
                     rfid_sticker_default = _pick_option(
-                        na_opts, "123130", "121612", "rfid sticker", "rfid tag",
-                        "hangtag package part", fallback="N/A",
+                        na_opts,
+                        "121612",        # most common RFID Sticker code
+                        "123130",        # alternate RFID Sticker code
+                        "rfid sticker",  # component name match
+                        "rfid tag",      # alternate component name
+                        fallback="N/A",
                     )
+
                     rfid_sticker_sel = st.selectbox("RFID Sticker", options=na_opts,
                         index=na_opts.index(rfid_sticker_default) if rfid_sticker_default in na_opts else 0,
                         key=f"rfid_sticker_{style_key}")
 
                 r5a, r5b = st.columns(2)
                 with r5a:
-                    # FIX: search by component name too, not just code
                     upc_default = _pick_option(
                         na_opts, "980010", "packaging 3", "upc", "polybag", fallback="N/A",
                     )
@@ -577,10 +662,8 @@ def render_comparison_tab():
 
     st.session_state["label_selections"] = label_selections
 
-    # ── Pagination BELOW the last settings expander ────────────────────────────
     render_pagination("label_map_page", lm_page, total_lm_pages, key_suffix="lm", show_page_text=True)
 
-    # Matched/unmatched info
     _match_sig = str(sorted(bom_dict.keys())) + ":" + style_col + ":" + str(comp_df.shape)
     if st.session_state.get("__match_hash") != _match_sig:
         _bom_keys    = list(bom_dict.keys())
@@ -595,7 +678,6 @@ def render_comparison_tab():
     if st.session_state.get("__unmatched_styles"):
         render_warn_banner(f"No BOM found for style(s): {', '.join(st.session_state['__unmatched_styles'])} — upload the matching PDF(s)")
 
-    # ── Quick Look — Per Style Settings ───────────────────────────────────────
     render_divider()
     st.markdown("""<div class="cx-meta">Quick Look — Per Style Settings</div>""", unsafe_allow_html=True)
 
@@ -718,9 +800,6 @@ def render_comparison_tab():
                 group_df["Validation Status"] = f"\u274c Error: No BOM loaded for style '{style_str}'"
                 result_parts.append(group_df)
                 continue
-            # label_selections is always saved under the exact bom_dict key (style_key),
-            # and matched_bom_key comes from the same bom_dict — so they always match exactly.
-            # No fuzzy fallback needed; fuzzy caused wrong settings to bleed across styles.
             per_style_settings = label_sels.get(matched_bom_key, {}) if use_settings else {}
             bom_with_labels    = dict(matched_bom)
             bom_with_labels["label_settings"]            = per_style_settings
@@ -745,10 +824,6 @@ def render_comparison_tab():
             keep = original_cols + [c for c in QUICK_COLUMNS if c in combined.columns]
             combined = combined[keep]
 
-        # ── FIX: _normalize_status must NOT blindly scan all cols for N/A.
-        # Optional fields (RFID w/o MSRP, glove-only cols) are legitimately N/A
-        # for non-glove products. Only override hard errors; trust validate_and_fill
-        # for ✅ Validated / ⚠️ Partial distinctions.
         status_scan_cols = [
             c for c in (NEW_COLUMNS + QUICK_COLUMNS)
             if c in combined.columns and c != "Validation Status"
@@ -757,15 +832,11 @@ def render_comparison_tab():
         if status_scan_cols:
             def _normalize_status(row):
                 raw_status = str(row.get("Validation Status", "")).strip().lower()
-                # Preserve hard error statuses unconditionally
                 if "error" in raw_status or "no match" in raw_status or "no bom loaded" in raw_status:
                     return "❌ Error: No match"
-                # Trust validate_and_fill's own status — it already knows which
-                # fields are required vs optional for this product type
                 existing = str(row.get("Validation Status", "")).strip()
                 if existing:
                     return existing
-                # Fallback: if status is blank for some reason, infer from core cols only
                 _core = ["Main Label", "Main Label Supplier", "Care Label",
                          "Care Supplier", "Content Code", "Care Code"]
                 has_core_na = any(

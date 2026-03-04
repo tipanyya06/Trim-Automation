@@ -106,9 +106,20 @@ def _qa_normalize_val(v):
     - Newlines collapsed to space before processing
     - OCR mid-word spaces collapsed ("packagin g" → "packaging")
     - Spaces before/after abbreviation periods removed ("Co. Ltd" → "Co.Ltd")
-    - All content-section prefixes stripped: "Shell:", "Lining:", "Body:", etc.
-      from ANY position in the string (handles multi-section TP FC values)
-    - Common content-code prefixes stripped
+    - All fabric-section label prefixes stripped from ANY position in the string:
+        Shell, Lining, Fleece Lining, Faux Fur, Insulation, Fill, Face,
+        Body, Trim, Outer, Inner, Fabric, Material
+      This handles multi-layer TP FC values regardless of layer order so that
+      "Shell: X\nLining: Y\nFaux Fur: Z" == "Shell: X\nFaux Fur: Z\nLining: Y"
+      after normalization.
+    - "Exclusive of Trimming" (and OCR-truncated variants like "Exclusive of Trimmin")
+      stripped — this trailing clause varies in placement and is sometimes cut off
+      by PDF extraction, causing false mismatches.
+    - Trailing legal-entity suffixes stripped from supplier names:
+        Ltd, LLC, Inc, Corp, Co., Co.Ltd, S.A., B.V., GmbH, Pte, Sdn Bhd, etc.
+      Handles OCR merging "Ltd" directly onto a name without a space, e.g.
+      "J-LongLtd" → "j-long". Only stripped at END of string to avoid
+      corrupting mid-name words.
     """
     if v is None:
         return ""
@@ -126,13 +137,43 @@ def _qa_normalize_val(v):
     # Normalize punctuation: remove spaces around abbreviation periods
     # "Co. Ltd" → "Co.Ltd", "Co. Ltd." → "Co.Ltd."
     s = re.sub(r"\.\s+([a-z]{1,5})(?=[\s.,)]|$)", r".\1", s)
-    # Strip ALL content-section prefixes wherever they appear (handles multi-section TP FC):
-    # "Shell: 100% Acrylic Lining: 100% Polyester..." → "100% Acrylic 100% Polyester..."
+
+    # ── TP FC / composition normalization ─────────────────────────────────────
+    # Strip ALL fabric-section label prefixes wherever they appear.
+    # Order matters: longer labels (e.g. "fleece lining") must be tried before
+    # shorter ones ("lining") to avoid partial matches — handled by alternation
+    # order in the regex (longest first).
     s = re.sub(
-        r"(?:^|(?<=\s))(shell|body|lining|fill|fabric|material|fleece lining)\s*:\s*",
+        r"(?:^|(?<=\s))"
+        r"(fleece lining|faux fur|insulation|shell|lining|fill|fabric|material"
+        r"|face|body|trim|outer|inner)"
+        r"\s*:\s*",
         " ", s
     ).strip()
-    # Final whitespace cleanup
+
+    # Strip "exclusive of trimming" (and OCR-truncated "exclusive of trimmin")
+    # This clause appears at the end of the last layer and is sometimes cut off
+    # by PDF text extraction — stripping it prevents false diff mismatches.
+    s = re.sub(r"\bexclusive of trimmin[g]?\b", "", s).strip()
+
+    # ── Supplier / company name normalization ─────────────────────────────────
+    # Strip common legal-entity suffixes that appear inconsistently across the
+    # actual output vs the expected reference file.
+    # Examples of real mismatches this fixes:
+    #   "j-longltd"        vs "j-long"        (OCR merges "Ltd" onto name)
+    #   "pt bsn co."       vs "pt bsn"        (trailing "co.")
+    #   "avery dennison global co" vs "avery dennison global"
+    #   "next gen packaging global ltd" vs "next gen packaging global"
+    # Strategy: strip these suffixes only when they appear at the END of the
+    # string (after optional punctuation/space), so we don't accidentally
+    # corrupt supplier names that contain these words mid-string.
+    s = re.sub(
+        r"[\s,.\-]*(co\.?ltd\.?|co\.,?ltd\.?|ltd\.?|llc\.?|inc\.?|corp\.?|"
+        r"co\.|s\.a\.?|b\.v\.?|gmbh\.?|plc\.?|pte\.?|sdn\.?|bhd\.?)$",
+        "", s
+    ).strip()
+
+    # Final whitespace cleanup after all substitutions
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -148,7 +189,9 @@ def _qa_values_match(a_norm: str, e_norm: str) -> bool:
     The normalization in _qa_normalize_val already handles the real sources
     of legitimate near-misses:
       - OCR mid-word spaces
-      - Section prefixes (Shell:/Lining:/Body:)
+      - Section prefixes (Shell:/Lining:/Faux Fur:/Insulation: etc.)
+      - "Exclusive of Trimming" / truncated "Exclusive of Trimmin"
+      - Trailing legal-entity suffixes (Ltd, Co., Inc, etc.)
       - Trailing .0 Excel artefacts
       - Abbreviation-period spacing
     After that, values should match exactly or genuinely differ.

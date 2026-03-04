@@ -328,9 +328,26 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
                     cw_name_col_idx = candidate + 1
                 break
 
-    current_content_code = ""
-    current_content_full = ""
-    colorway_map: dict = {}
+    # ── BUG 4 FIX: Section-aware accumulator ─────────────────────────────────
+    # The original code used a single colorway_map and single current_content_code
+    # for the entire document. When a Content Report has MULTIPLE CONTENT CODE
+    # sections (e.g. S8V for colorway 278, LAZ for colorways 624/465/342/...),
+    # all colorways were lumped into one map and assigned the same code — wrong.
+    #
+    # Fix: flush and reset colorway_map + _composition_parts each time a new
+    # CONTENT CODE header is detected. Accumulate into a sections list and emit
+    # all rows at the end, one per (content_code, colorway) pairing.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Composition label detection — longest label checked first to avoid
+    # "lining" matching "fleece lining" rows.
+    _COMPOSITION_LABELS = [
+        ("fleece lining", "Fleece Lining"),
+        ("faux fur",      "Faux Fur"),
+        ("insulation",    "Insulation"),
+        ("lining",        "Lining"),
+        ("shell",         "Shell"),
+    ]
 
     _skip_patterns = [
         r'content report line slot',
@@ -340,20 +357,61 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
         r'colorway name',
     ]
 
+    # Per-section state — reset when a new CONTENT CODE header is found
+    sections: list = []            # list of (content_code, enriched_full, colorway_map)
+    current_content_code: str = ""
+    current_content_full: str = ""
+    colorway_map: dict = {}
+    _composition_parts: list = []  # accumulated "Label: text" strings for current section
+
+    def _flush_section():
+        """Save the current section to sections[] if it has data."""
+        if current_content_code and colorway_map:
+            _compo_suffix = (
+                "  " + "  ".join(_composition_parts) if _composition_parts else ""
+            )
+            enriched = current_content_full + _compo_suffix
+            sections.append((current_content_code, enriched, dict(colorway_map)))
+
     for row in all_rows:
         row_text = " ".join(row).lower()
 
         if any(re.search(p, row_text) for p in _skip_patterns):
             pass
 
+        # ── Detect new CONTENT CODE section ──────────────────────────────────
         for cell in row:
             if "CONTENT CODE" in cell.upper():
                 m = re.search(r'CONTENT CODE[:\s]+(\w+)', cell, re.IGNORECASE)
                 if m:
+                    # Flush the previous section before starting a new one
+                    _flush_section()
+
+                    # Reset state for the new section
                     current_content_code = m.group(1).strip()
                     current_content_full = cell.strip()
+                    colorway_map = {}
+                    _composition_parts = []
                 break
 
+        # ── Detect composition label rows (Shell / Lining / Fleece Lining / …) ──
+        # Rows look like: ["Shell:", "100% Acrylic", ..., "398", "Lime Glow"]
+        # or:             ["Lining:", "100% Polyester Exclusive of Trimming", ...]
+        if row and len(row) >= 2:
+            first_cell = row[0].strip().rstrip(":").lower()
+            second_cell = row[1].strip() if len(row) > 1 else ""
+            if second_cell and second_cell.lower() not in ("", "none", "nan"):
+                for match_key, canonical_label in _COMPOSITION_LABELS:
+                    if first_cell == match_key or first_cell.startswith(match_key):
+                        label_str = f"{canonical_label}: {second_cell}"
+                        already = any(
+                            p.startswith(f"{canonical_label}:") for p in _composition_parts
+                        )
+                        if not already:
+                            _composition_parts.append(label_str)
+                        break
+
+        # ── Detect colorway number rows ───────────────────────────────────────
         cw_num = ""
         cw_name = ""
         if cw_num_col_idx is not None and len(row) > cw_num_col_idx:
@@ -361,21 +419,26 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
         if cw_name_col_idx is not None and len(row) > cw_name_col_idx:
             cw_name = row[cw_name_col_idx].strip()
 
+        # Only add each colorway number once per section (first-seen wins within section)
         if re.match(r'^\d{3}$', cw_num) and cw_num not in colorway_map:
             colorway_map[cw_num] = cw_name
 
-    if not colorway_map or not current_content_code:
+    # Flush the final section
+    _flush_section()
+
+    if not sections:
         return pd.DataFrame()
 
-    output_rows = [
-        {
-            "Color Way Number": cw_num,
-            "Color Way Name":   cw_name,
-            "Content Code":     current_content_code,
-            "Content Full":     current_content_full,
-        }
-        for cw_num, cw_name in colorway_map.items()
-    ]
+    # Build output rows from ALL sections — each colorway gets its own section's code
+    output_rows = []
+    for (content_code, enriched_full, cw_map) in sections:
+        for cw_num, cw_name in cw_map.items():
+            output_rows.append({
+                "Color Way Number": cw_num,
+                "Color Way Name":   cw_name,
+                "Content Code":     content_code,
+                "Content Full":     enriched_full,
+            })
 
     return pd.DataFrame(output_rows)
 
