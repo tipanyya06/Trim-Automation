@@ -1,6 +1,7 @@
 from typing import Dict, Any, Optional
 import pandas as pd
 import re
+import sys
 
 from parsers.color_bom import extract_color_bom_lookup
 from parsers.care_content import extract_care_codes, extract_content_codes
@@ -180,7 +181,6 @@ def _strip_numeric_prefix(color_name: str) -> str:
 
 
 def _extract_id_from_settings_string(raw: str) -> str:
-    """Extract trailing numeric code from 'Component Name - 123456' style strings."""
     if not raw or raw in ("N/A", ""):
         return ""
     if " - " in raw:
@@ -272,10 +272,6 @@ def _find_supplier_in_costing(costing_df, code: str) -> str:
 
 
 def _find_code_in_costing_by_desc(costing_df, *keywords) -> str:
-    """
-    Scan costing_detail for a row whose description contains ALL given keywords,
-    then return the first numeric material code found in that row.
-    """
     if costing_df is None or costing_df.empty:
         return ""
     desc_col = None
@@ -286,7 +282,6 @@ def _find_code_in_costing_by_desc(costing_df, *keywords) -> str:
             break
     if not desc_col:
         desc_col = costing_df.columns[0]
-
     for _, row in costing_df.iterrows():
         desc = str(row.get(desc_col, "")).lower()
         if all(kw.lower() in desc for kw in keywords):
@@ -301,25 +296,8 @@ def _find_code_in_costing_by_desc(costing_df, *keywords) -> str:
 
 
 def _find_code_in_costing_fuzzy(costing_df, *keyword_groups) -> str:
-    """
-    BUG 1 FIX — Fuzzy costing search for 'Hangtag Package Part' and similar rows
-    whose description wording varies across PDF sources.
-
-    Each positional arg is tried in order until a code is found:
-      - str  → all words in the string must appear in the description (AND logic)
-      - list → any element of the list must fully match (OR logic)
-
-    Examples of description variants found in real PDFs:
-      "Hangtag Package Part"  "Hangtag Pkg Part"  "HT Package Part"
-      "Hangtag Pack Part"     "Hang Tag Package"  "Package Hangtag"
-
-    The original _find_code_in_costing_by_desc("hangtag package part") only
-    matched the exact phrase, leaving 97305 (RFID Tag) as the fallback for 7+
-    styles that store their 121612/123130 code only in costing_detail.
-    """
     if costing_df is None or costing_df.empty:
         return ""
-
     desc_col = None
     for col in costing_df.columns:
         cl = str(col).lower()
@@ -332,7 +310,6 @@ def _find_code_in_costing_fuzzy(costing_df, *keyword_groups) -> str:
     def _row_matches_group(desc: str, group) -> bool:
         if isinstance(group, str):
             return all(w in desc for w in group.lower().split())
-        # list / tuple — any element fully matches
         return any(all(w in desc for w in str(g).lower().split()) for g in group)
 
     for group in keyword_groups:
@@ -600,7 +577,6 @@ def validate_and_fill(
         return _normalize_supplier_alias(matched)
 
     def get_code(comp_key: str) -> str:
-        """Look up material code from color BOM components dict."""
         if not comp_key:
             return ""
         if comp_key in components:
@@ -648,7 +624,11 @@ def validate_and_fill(
             if df is None or df.empty:
                 return ""
             comp_col = df.columns[0]
-            lookup_name = component_name.split(" - ")[0].strip() if " - " in component_name else component_name
+
+            lookup_name = (
+                component_name.split(" - ")[0].strip()
+                if " - " in component_name else component_name
+            )
             lookup_lower = lookup_name.strip().lower()
 
             def _strict_match(v):
@@ -667,17 +647,21 @@ def validate_and_fill(
                         str(v).split(" - ")[0] if " - " in str(v) else str(v), lookup_name
                     )
                 )]
+
                 _non_color_hints = ("store", "outlet", "retail", "channel", "vendor", "factory")
                 if not row_match.empty:
                     cw_cols_check = [c for c in df.columns[1:] if c]
+
                     def _row_has_bad_color(r):
                         for col in cw_cols_check:
                             cv = str(r.get(col, "")).lower()
                             if any(h in cv for h in _non_color_hints):
                                 return True
                         return False
+
                     good_rows = row_match[~row_match.apply(_row_has_bad_color, axis=1)]
-                    row_match = good_rows if not good_rows.empty else pd.DataFrame()
+                    # FIX: keep original row_match instead of empty DataFrame
+                    row_match = good_rows if not good_rows.empty else row_match
 
             if row_match.empty:
                 return ""
@@ -701,12 +685,32 @@ def validate_and_fill(
                             return v
                         if v.lower() in _COLOR_REDIRECT_VALUES:
                             return _strip_numeric_prefix(matched_cw)
+
+            # ── Uniform-color fallback ────────────────────────────────────────
+            # When matched_cw doesn't appear as a column (e.g. Label 1 is on a
+            # different BOM page, or this is a fabric-only BOM where the label
+            # row has the same color for every colorway), check if ALL non-empty
+            # colorway values are identical. If so, that value IS the color.
+            # This handles "White, Black" labels that are color-invariant.
+            non_empty_vals = [
+                str(row_match.iloc[0][col]).strip()
+                for col in cw_cols
+                if str(row_match.iloc[0].get(col, "")).strip().lower()
+                not in ("", "none", "nan")
+            ]
+            unique_vals = set(v for v in non_empty_vals if _accept(v))
+            if len(unique_vals) == 1:
+                return unique_vals.pop()
+
             return ""
-        
 
         res = _lookup_in_df(bom_data.get("color_bom"))
         if not res:
             res = _lookup_in_df(color_spec)
+        if not res:
+            # Pattern B fix: Label 1 may only exist in colorless_bom for
+            # fabric-only BOMs that don't include label rows in color_bom.
+            res = _lookup_in_df(bom_data.get("colorless_bom"))
         return res
 
     def _extract_num_prefix(s: str) -> str:
@@ -732,39 +736,17 @@ def validate_and_fill(
         return _nv(e.get(key, ""))
 
     def get_content(key, matched_cw, cw_num, raw=""):
-        """
-        BUG 4/5 FIX + TP FC FIX:
-        Look up content code/shell for the given colorway.
-
-        Priority order:
-          1. Exact matched_cw key (e.g. "262-Canoe, Mountains")
-          2. 3-digit cw_num extracted from matched_cw or raw color string
-          3. Stripped cw_num (leading zeros removed)
-          4. 3-digit prefix extracted from raw color string
-          5. __default__ — only present when the whole BOM has ONE content section
-
-        The __default__ key is set by extract_content_codes only for single-section
-        BOMs, so multi-section BOMs (different compositions per colorway) will
-        return "" (→ "N/A") for unknown colorways rather than silently using the
-        wrong section's data.
-
-        Leading/trailing whitespace in content_code values is stripped to fix
-        cases where the PDF parser emits " SR1" or " O1X" instead of "SR1"/"O1X".
-        """
         raw_prefix = _extract_num_prefix(raw)
         cw_num_stripped = cw_num.lstrip("0") or cw_num
-
         e = (
             content_codes.get(matched_cw)
             or content_codes.get(cw_num)
             or content_codes.get(cw_num_stripped)
             or (content_codes.get(raw_prefix) if raw_prefix else None)
-            or content_codes.get("__default__")   # only present for single-section BOMs
+            or content_codes.get("__default__")
             or {}
         )
         val = e.get(key, "")
-        # Strip stray leading/trailing whitespace that PDF extraction sometimes
-        # introduces (e.g. " SR1" → "SR1", " O1X" → "O1X")
         if isinstance(val, str):
             val = val.strip()
         return _nv(val)
@@ -894,28 +876,51 @@ def validate_and_fill(
             raw_main = _found if _found else next(iter(components), "")
 
         if not raw_care and components:
-            _found = _find_comp_startswith(["label 1", "care label"])
+            _found = _find_comp_startswith([
+                "label 1 -", "label 1",
+                "care label", "care content label",
+            ])
             if _found:
                 raw_care = _found
 
-        # ── RFID Sticker auto-detect ─────────────────────────────────────────
-        # ROOT CAUSE FIX:
-        # "Hangtag Package Part" in the Color BOM = 097305 (the physical hangtag).
-        # The RFID Sticker (121612 / 123130) is a DIFFERENT costing_detail row
-        # described as "RFID Sticker", "RFID Tag", "Hangtag RFID Sticker", etc.
-        #
-        # Previous code searched costing for "hangtag package part" and extracted
-        # whichever code it found first — which was 097305, not 121612.
-        #
-        # Fix: search costing_detail for rows whose description contains "rfid".
-        # This reliably finds 121612/123130 without conflating them with the hangtag.
+        # ── TEMPORARY DEBUG (first row only) — paste output here then remove ──
+        if idx == result.index[0]:
+            print("\n========== CARE LABEL DEBUG ==========", file=sys.stderr)
+            print(f"[1]  label_settings keys         : {list(label_settings.keys())}", file=sys.stderr)
+            print(f"[2]  label_settings['care_label']: {repr(label_settings.get('care_label', '__MISSING__'))}", file=sys.stderr)
+            print(f"[3]  raw_care (after auto-detect): {repr(raw_care)}", file=sys.stderr)
+            if raw_care and " - " in str(raw_care):
+                _p = str(raw_care).rsplit(" - ", 1)
+                print(f"[4]  split_comp → comp={repr(_p[0].strip())}  id={repr(_p[1].strip())}", file=sys.stderr)
+            else:
+                print(f"[4]  split_comp → comp={repr(raw_care)}  id=''  (no ' - ' found)", file=sys.stderr)
+            print(f"[5]  components count            : {len(components)}", file=sys.stderr)
+            print(f"[6]  components (first 15)       : {list(components.keys())[:15]}", file=sys.stderr)
+            _l1 = [k for k in components if 'label 1' in k.lower()]
+            print(f"[7]  components w/ 'label 1'     : {_l1}", file=sys.stderr)
+            print(f"[8]  matched_cw                  : {repr(matched_cw)}", file=sys.stderr)
+            _cb = bom_data.get("color_bom")
+            if _cb is not None and not _cb.empty:
+                print(f"[9]  color_bom shape             : {_cb.shape}", file=sys.stderr)
+                print(f"[10] color_bom columns           : {list(_cb.columns)}", file=sys.stderr)
+                _comp_col_d = _cb.columns[0]
+                _l1rows = _cb[_cb[_comp_col_d].astype(str).str.lower().str.contains('label 1')]
+                print(f"[11] 'label 1' rows in BOM       : {len(_l1rows)}", file=sys.stderr)
+                if not _l1rows.empty:
+                    print(f"[12] label 1 row values          : {_l1rows.iloc[0].to_dict()}", file=sys.stderr)
+            else:
+                print(f"[9]  color_bom                   : EMPTY or None", file=sys.stderr)
+            print(f"[13] selected_care_label_comp    : {repr(bom_data.get('selected_care_label_comp', '__MISSING__'))}", file=sys.stderr)
+            print(f"[14] bom_data keys               : {list(bom_data.keys())}", file=sys.stderr)
+            print("=======================================\n", file=sys.stderr)
+        # ── END DEBUG ─────────────────────────────────────────────────────────
+
+        # ── RFID Sticker auto-detect ──────────────────────────────────────────
         if not raw_rfid_sticker:
-            # Step 1: scan costing for any row described as "rfid ..."
             _rfid_code_from_costing = _find_code_in_costing_by_desc(costing_detail, "rfid")
             if _rfid_code_from_costing:
                 raw_rfid_sticker = f"RFID Sticker - {_rfid_code_from_costing}"
             else:
-                # Step 2: scan costing for known RFID codes (121612, 123130) anywhere
                 _RFID_KNOWN = ("121612", "123130")
                 for _, _crow in (costing_detail.iterrows() if costing_detail is not None and not costing_detail.empty else []):
                     for _col in costing_detail.columns:
@@ -926,18 +931,12 @@ def validate_and_fill(
                     if raw_rfid_sticker:
                         break
             if not raw_rfid_sticker:
-                # Step 3: fall back to color BOM components that mention "rfid"
-                _auto_rfid = _auto_comp_with_code(
-                    ["rfid sticker", "rfid tag", "rfid label"]
-                )
+                _auto_rfid = _auto_comp_with_code(["rfid sticker", "rfid tag", "rfid label"])
                 if _auto_rfid:
                     raw_rfid_sticker = _auto_rfid
 
-
         if not raw_upc:
-            _auto = _auto_comp_with_code(
-                ["packaging 3", "upc sticker", "upc bag", "polybag"]
-            )
+            _auto = _auto_comp_with_code(["packaging 3", "upc sticker", "upc bag", "polybag"])
             if _auto:
                 raw_upc = _auto
 
@@ -962,12 +961,10 @@ def validate_and_fill(
         ht2_comp,  ht2_id  = split_comp(raw_ht2)
         ht3_comp,  ht3_id  = split_comp(raw_ht3)
 
-        # ── Embroidery / Jacquard flags ───────────────────────────────────────
         _is_embroidery = _is_embroidery_label(raw_main)
         _is_jacquard   = (not _is_embroidery) and _is_jacquard_label(main_comp, components)
         _suppress      = _is_embroidery or _is_jacquard
 
-        # Main label code
         if main_id:
             main_code = main_id
         else:
@@ -983,7 +980,6 @@ def validate_and_fill(
         size_label_code   = _resolve_settings_code(raw_size_label)   if raw_size_label   else "N/A"
         size_sticker_code = _resolve_settings_code(raw_size_sticker) if raw_size_sticker else "N/A"
 
-        # ── Hangtag code ──────────────────────────────────────────────────────
         ht_cw   = get_cw_val("Hangtag Package Part", matched_cw)
         ht_code = ht_id or get_code(ht_comp) if (ht_comp or ht_id) else get_code("Hangtag Package Part")
         if costing_hangtag_code == "N/A":
@@ -994,7 +990,6 @@ def validate_and_fill(
         ht2_code = ht2_id or (get_code(ht2_comp) if ht2_comp else "")
         ht3_code = ht3_id or (get_code(ht3_comp) if ht3_comp else "")
 
-        # ── RFID w/o MSRP ────────────────────────────────────────────────────
         rfid_no_msrp_code = rfid_no_msrp_sup = ""
         if raw_rfid_no_msrp:
             rfid_no_msrp_code = _resolve_settings_code(raw_rfid_no_msrp)
@@ -1013,7 +1008,6 @@ def validate_and_fill(
             rfid_no_msrp_code = "N/A"
             rfid_no_msrp_sup  = "N/A"
 
-        # ── RFID Hangtag (w/ MSRP) ────────────────────────────────────────────
         rfid_code = ""
         if raw_rfid:
             rfid_comp_name, rfid_id = split_comp(raw_rfid)
@@ -1030,26 +1024,17 @@ def validate_and_fill(
             )
         rfid_supplier = resolve_supplier(rfid_code) if rfid_code else resolve_supplier(ht_code)
 
-        # ── RFID Sticker code resolution ─────────────────────────────────────
         rfid_sticker_code = ""
         if raw_rfid_sticker:
-            rfid_sticker_code = _resolve_settings_code(
-                raw_rfid_sticker, "rfid sticker", "rfid tag"
-                # NOTE: "hangtag package" intentionally removed — that row holds
-                # 097305 (the physical hangtag), not the RFID sticker code.
-            )
+            rfid_sticker_code = _resolve_settings_code(raw_rfid_sticker, "rfid sticker", "rfid tag")
         if not rfid_sticker_code:
-            # Search costing for any row described as "rfid" — finds 121612/123130
             rfid_sticker_code = _find_code_in_costing_by_desc(costing_detail, "rfid")
         if not rfid_sticker_code:
-            rfid_sticker_code = _scan_costing_for_component(
-                costing_detail, "rfid sticker", "rfid tag", "rfid label"
-            )
+            rfid_sticker_code = _scan_costing_for_component(costing_detail, "rfid sticker", "rfid tag", "rfid label")
         if not rfid_sticker_code:
             rfid_sticker_code = rfid_code
         rfid_sticker_sup = resolve_supplier(rfid_sticker_code) if rfid_sticker_code else "N/A"
 
-        # ── UPC Sticker ───────────────────────────────────────────────────────
         upc_code = ""
         if raw_upc:
             upc_code = _resolve_settings_code(raw_upc, "packaging 3", "upc", "polybag")
@@ -1059,7 +1044,6 @@ def validate_and_fill(
             upc_code = _scan_costing_for_component(costing_detail, "polybag", "upc bag", "packaging 3")
         upc_cw = get_cw_val("Packaging 3", matched_cw)
 
-        # ── Auto-alt-scan for main label color fallbacks ──────────────────────
         _user_set_fb1 = bool(main_fallback_comp)
         _user_set_fb2 = bool(main_fallback_comp2)
 
@@ -1087,7 +1071,6 @@ def validate_and_fill(
         _effective_fb2     = main_fallback_comp2
         _effective_fb2_raw = raw_main_fallback2 or _effective_fb2
 
-        # ── Main label color resolution ───────────────────────────────────────
         resolved_main_code, main_color = _resolve_main_label_color_with_fallback(
             primary_comp=main_comp,
             fallback_comp=_effective_fb1,
@@ -1105,7 +1088,6 @@ def validate_and_fill(
             sketch_data=sketch_data,
         )
 
-        # ── Effective main code priority ──────────────────────────────────────
         _is_hat_comp = any(
             kw in str(main_comp).lower()
             for kw in ("hat component", "hat components", "alt hat")
@@ -1143,7 +1125,6 @@ def validate_and_fill(
         care_color = get_color_from_spec(care_comp, matched_cw, color_raw)
         logo_color = get_color_from_spec("Label Logo 1", matched_cw, color_raw)
 
-        # ── Write output columns ──────────────────────────────────────────────
         result.at[idx, "Main Label"]          = effective_main_code
         result.at[idx, "Main Label Color"]    = "N/A" if _suppress else (main_color or "N/A")
         result.at[idx, "Main Label Supplier"] = "N/A" if _suppress else resolve_supplier(effective_main_code, "main_label")
@@ -1196,7 +1177,6 @@ def validate_and_fill(
             if not str(result.at[idx, field]).strip():
                 result.at[idx, field] = label_settings.get(key, "")
 
-        # ── Validation Status ─────────────────────────────────────────────────
         main_label_val  = str(result.at[idx, "Main Label"]).strip()
         main_color_val  = str(result.at[idx, "Main Label Color"]).strip()
         label_has_value = main_label_val not in ("N/A", "", "nan")
