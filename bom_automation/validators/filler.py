@@ -702,6 +702,7 @@ def validate_and_fill(
                         if v.lower() in _COLOR_REDIRECT_VALUES:
                             return _strip_numeric_prefix(matched_cw)
             return ""
+        
 
         res = _lookup_in_df(bom_data.get("color_bom"))
         if not res:
