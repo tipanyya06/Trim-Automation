@@ -883,38 +883,6 @@ def validate_and_fill(
             if _found:
                 raw_care = _found
 
-        # ── TEMPORARY DEBUG (first row only) — paste output here then remove ──
-        if idx == result.index[0]:
-            print("\n========== CARE LABEL DEBUG ==========", file=sys.stderr)
-            print(f"[1]  label_settings keys         : {list(label_settings.keys())}", file=sys.stderr)
-            print(f"[2]  label_settings['care_label']: {repr(label_settings.get('care_label', '__MISSING__'))}", file=sys.stderr)
-            print(f"[3]  raw_care (after auto-detect): {repr(raw_care)}", file=sys.stderr)
-            if raw_care and " - " in str(raw_care):
-                _p = str(raw_care).rsplit(" - ", 1)
-                print(f"[4]  split_comp → comp={repr(_p[0].strip())}  id={repr(_p[1].strip())}", file=sys.stderr)
-            else:
-                print(f"[4]  split_comp → comp={repr(raw_care)}  id=''  (no ' - ' found)", file=sys.stderr)
-            print(f"[5]  components count            : {len(components)}", file=sys.stderr)
-            print(f"[6]  components (first 15)       : {list(components.keys())[:15]}", file=sys.stderr)
-            _l1 = [k for k in components if 'label 1' in k.lower()]
-            print(f"[7]  components w/ 'label 1'     : {_l1}", file=sys.stderr)
-            print(f"[8]  matched_cw                  : {repr(matched_cw)}", file=sys.stderr)
-            _cb = bom_data.get("color_bom")
-            if _cb is not None and not _cb.empty:
-                print(f"[9]  color_bom shape             : {_cb.shape}", file=sys.stderr)
-                print(f"[10] color_bom columns           : {list(_cb.columns)}", file=sys.stderr)
-                _comp_col_d = _cb.columns[0]
-                _l1rows = _cb[_cb[_comp_col_d].astype(str).str.lower().str.contains('label 1')]
-                print(f"[11] 'label 1' rows in BOM       : {len(_l1rows)}", file=sys.stderr)
-                if not _l1rows.empty:
-                    print(f"[12] label 1 row values          : {_l1rows.iloc[0].to_dict()}", file=sys.stderr)
-            else:
-                print(f"[9]  color_bom                   : EMPTY or None", file=sys.stderr)
-            print(f"[13] selected_care_label_comp    : {repr(bom_data.get('selected_care_label_comp', '__MISSING__'))}", file=sys.stderr)
-            print(f"[14] bom_data keys               : {list(bom_data.keys())}", file=sys.stderr)
-            print("=======================================\n", file=sys.stderr)
-        # ── END DEBUG ─────────────────────────────────────────────────────────
-
         # ── RFID Sticker auto-detect ──────────────────────────────────────────
         if not raw_rfid_sticker:
             _rfid_code_from_costing = _find_code_in_costing_by_desc(costing_detail, "rfid")
@@ -970,7 +938,44 @@ def validate_and_fill(
         else:
             main_code = get_code(main_comp) if main_comp else "N/A"
 
-        care_code_mat = care_id if care_id else (get_code(care_comp) if care_comp else "N/A")
+        # ── FIX: care_code_mat — multi-stage resolution ───────────────────────
+        # Stage 1: use explicit care_id from settings (e.g. "Label 1 - 003287")
+        # Stage 2: look up care_comp in color_bom components dict
+        # Stage 3: search colorless_bom (fabric-only BOMs omit Label 1 from color_bom)
+        # Stage 4: fuzzy search costing detail for known care label codes
+        care_code_mat = care_id if care_id else (get_code(care_comp) if care_comp else "")
+
+        if not care_code_mat and care_comp:
+            _clb = bom_data.get("colorless_bom")
+            if _clb is not None and not _clb.empty:
+                _clb_comp_col = _clb.columns[0]
+                _clb_match = _clb[_clb[_clb_comp_col].apply(
+                    lambda v: _comp_names_match(str(v), care_comp)
+                )]
+                if not _clb_match.empty:
+                    _clb_desc_col = next(
+                        (c for c in _clb.columns
+                         if "detail" in str(c).lower() or "desc" in str(c).lower()),
+                        None,
+                    )
+                    if _clb_desc_col:
+                        _clb_desc_val = str(_clb_match.iloc[0].get(_clb_desc_col, ""))
+                        _clb_m = re.search(r'\b(\d{4,7})\b', _clb_desc_val)
+                        if _clb_m:
+                            care_code_mat = _clb_m.group(1)
+
+        if not care_code_mat:
+            care_code_mat = _find_code_in_costing_fuzzy(
+                costing_detail,
+                ["care content label"],
+                ["care label"],
+                ["003287"],
+                ["067535"],
+            )
+
+        if not care_code_mat:
+            care_code_mat = "N/A"
+        # ── END FIX ───────────────────────────────────────────────────────────
 
         logo_code = (
             get_code(raw_add_main.split(" - ")[0]) if raw_add_main
@@ -1122,7 +1127,11 @@ def validate_and_fill(
             else:
                 _suppress = False
 
-        care_color = get_color_from_spec(care_comp, matched_cw, color_raw)
+        # ── FIX: guard against None care_comp for color lookup ────────────────
+        _care_comp_for_color = care_comp if care_comp else "Label 1"
+        care_color = get_color_from_spec(_care_comp_for_color, matched_cw, color_raw)
+        # ── END FIX ───────────────────────────────────────────────────────────
+
         logo_color = get_color_from_spec("Label Logo 1", matched_cw, color_raw)
 
         result.at[idx, "Main Label"]          = effective_main_code
