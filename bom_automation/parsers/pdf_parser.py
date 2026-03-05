@@ -4,7 +4,7 @@ from typing import Dict, Any
 import pandas as pd
 import pdfplumber
 
-from parsers.detail_sketch import parse_detail_sketches, get_sketch_color
+from parsers.detail_sketch import parse_detail_sketch_pages, get_sketch_color
 
 def _clean_table(rows):
     cleaned = []
@@ -664,7 +664,7 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
             result.setdefault(key, pd.DataFrame())
 
         result["supplier_lookup"] = _build_supplier_lookup(result.get("costing_detail", pd.DataFrame()))
-        result["detail_sketch"] = parse_detail_sketches(pdf)
+        result["detail_sketch"] = parse_detail_sketch_pages(pdf_file_obj)
 
         return result
 

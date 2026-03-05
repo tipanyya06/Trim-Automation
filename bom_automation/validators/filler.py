@@ -29,6 +29,13 @@ _SUPPLIER_ALIASES: list[tuple[str, str]] = [
 
 _COLOR_REDIRECT_VALUES = {"artwork", "stock", "standard", "std"}
 
+# ── Values treated as "no color data" — triggers sketch lookup ────────────────
+# NOTE: "none" is intentionally included here so that when the Color BOM shows
+# "None" for an alt component (e.g. 135957 on colorways 447/342/310/845/256),
+# the resolver will fall through and consult the Detail Sketch, which carries
+# the actual 5-thread color assignments for those colorways.
+_EMPTY_OR_REDIRECT = _COLOR_REDIRECT_VALUES | {"none", "nan", ""}
+
 
 def _normalize_supplier_alias(supplier: str) -> str:
     if not supplier or supplier == "N/A":
@@ -175,9 +182,24 @@ def _get_material_code_for_comp(comp: dict) -> str:
 
 
 def _strip_numeric_prefix(color_name: str) -> str:
+    """
+    Strip leading numeric prefix from a colorway name, e.g.
+    "256-Tobacco" → "Tobacco", "466-Collegiate Navy, Logo" → "Collegiate Navy".
+
+    Also removes trailing noise tokens that are colorway decorators rather than
+    actual color names: "Logo", "Marled" (and compound suffixes like
+    "Dark Nocturnal Marled").  These tokens appear in colorway display names
+    but must not leak into the Main Label Color output.
+    """
     s = str(color_name).strip()
     m = re.match(r'^\d+[-\s]+(.+)$', s)
-    return m.group(1).strip() if m else s
+    if m:
+        s = m.group(1).strip()
+    # Remove trailing noise suffixes: ", Logo" / ", Marled" / "Marled" alone
+    s = re.sub(r',?\s*\bLogo\b\s*$', '', s, flags=re.IGNORECASE).strip()
+    s = re.sub(r',?\s*\bMarled\b\s*$', '', s, flags=re.IGNORECASE).strip()
+    s = re.sub(r',?\s*\bNeps\b\s*$', '', s, flags=re.IGNORECASE).strip()
+    return s
 
 
 def _extract_id_from_settings_string(raw: str) -> str:
@@ -236,32 +258,64 @@ def _color_richness(s: str) -> int:
 
 def _get_alt_names_from_color_bom(cb_df: pd.DataFrame) -> list:
     """
-    Return an ordered, deduplicated list of component names that start with
-    "alt" from the color BOM DataFrame.
-
-    The raw color_bom DataFrame has blank Component cells on continuation rows
-    (page-2 colorway columns for the same component). Without forward-filling,
-    those rows are invisible and the corresponding alt component is never found.
-
-    Using .unique() preserves first-seen order while deduplicating so the same
-    component name from multiple continuation rows doesn't appear repeatedly.
+    Return an ordered, deduplicated list of alt component names from the
+    color BOM in "Name - CODE" format when a material code is available.
     """
     if cb_df is None or cb_df.empty:
         return []
     comp_col = cb_df.columns[0]
-    # Forward-fill blank component names so continuation rows are attributed
-    # to the correct preceding component.
+
+    details_col = None
+    for c in cb_df.columns[1:]:
+        cl = str(c).strip().lower()
+        if cl in ("details", "description", "desc"):
+            details_col = c
+            break
+    if details_col is None and len(cb_df.columns) > 1:
+        details_col = cb_df.columns[1]
+
     _comp_series = cb_df[comp_col].astype(str).str.strip()
     _comp_filled = _comp_series.copy()
     _comp_filled[_comp_filled.isin(["", "None", "nan"])] = pd.NA
     _comp_filled = _comp_filled.ffill().fillna("")
-    # Collect unique names that start with "alt", preserving order.
+
     seen: dict = {}
-    for v in _comp_filled:
-        v = str(v).strip()
-        if v.lower().startswith("alt") and v not in seen:
-            seen[v] = None
-    return list(seen.keys())
+    for row_idx, comp_name in _comp_filled.items():
+        comp_name = str(comp_name).strip()
+        if not comp_name.lower().startswith("alt"):
+            continue
+        if comp_name in seen:
+            continue
+        code = ""
+        if details_col is not None:
+            try:
+                details_val = str(cb_df.at[row_idx, details_col]).strip()
+            except (KeyError, ValueError):
+                details_val = ""
+            m = re.match(r'^(\d{5,7})\b', details_val)
+            if m:
+                code = m.group(1)
+            else:
+                m2 = re.search(r'\b(\d{5,7})\b', details_val)
+                if m2:
+                    code = m2.group(1)
+        label = f"{comp_name} - {code}" if code else comp_name
+        seen[comp_name] = label
+
+    return list(seen.values())
+
+
+# ── Forward-fill helper ───────────────────────────────────────────────────────
+
+def _ffill_comp_col(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    comp_col = out.columns[0]
+    _series = out[comp_col].astype(str).str.strip()
+    _series[_series.isin(["", "None", "nan"])] = pd.NA
+    out[comp_col] = _series.ffill().fillna("")
+    return out
 
 
 # ── Costing helpers ───────────────────────────────────────────────────────────
@@ -457,6 +511,25 @@ def _resolve_alt_component_color(
     fallback_comp, fallback_raw_sel, matched_cw, color_raw,
     color_bom_df, color_spec_df, get_color_fn, sketch_data=None,
 ):
+    """
+    Resolve color for an alt component.
+
+    FIX: Previously, when the Color BOM showed "None" for an alt component on a
+    given colorway (e.g. Alt Hat Component 1C / 135957 on colorways 447, 342,
+    310, 845, 256), the function would fall through and return ("", "") without
+    ever consulting the Detail Sketch.  The Detail Sketch is the authoritative
+    source of thread color assignments for woven patch components and carries
+    5-thread color strings that should override the shallow BOM lookup.
+
+    The fix adds a Detail Sketch lookup as the FINAL fallback before giving up:
+      - After exhausting BOM and color_spec lookups
+      - If comp_code is known and sketch_data is available
+      - Returns sketch color (e.g. "White, Collegiate Navy, Black, Phoenix Blue,
+        Fathom Blue" for 135957 on colorway 447)
+
+    This makes the richness comparison in the main loop pick 135957 (richness=5)
+    over 128516 (richness=1) for those colorways.
+    """
     if not fallback_comp:
         return ("", "")
     comp_code = _extract_code_from_comp_name(fallback_raw_sel or fallback_comp)
@@ -483,6 +556,8 @@ def _resolve_alt_component_color(
             if comp_code:
                 break
 
+    # ── BOM / color_spec lookup ───────────────────────────────────────────────
+    bom_cell_found = False
     for df in (color_bom_df, color_spec_df):
         if df is None or df.empty:
             continue
@@ -501,8 +576,12 @@ def _resolve_alt_component_color(
         cell_val = str(row_match.iloc[0].get(target_col, "")).strip()
         cell_lower = cell_val.lower()
         if not cell_val or cell_lower in ("", "none", "nan"):
+            # Continuation row / no data — continue to next df, do NOT return yet.
+            # After the loop, we will try the Detail Sketch.
+            bom_cell_found = True  # we found the row, just no color value
             continue
         if cell_lower in _COLOR_REDIRECT_VALUES:
+            # ── FIX: also try sketch before falling back to colorway name ────
             if sketch_data and comp_code:
                 sketch_color = get_sketch_color(sketch_data, comp_code, matched_cw)
                 if sketch_color:
@@ -510,7 +589,18 @@ def _resolve_alt_component_color(
             color = _strip_numeric_prefix(matched_cw or target_col)
             return (comp_code, color)
         return (comp_code, cell_val)
-    # Final fallback: try get_color_fn directly with the component name
+
+    # ── FIX: Detail Sketch fallback ───────────────────────────────────────────
+    # Reached when BOM/color_spec has no color data (None/empty) for this
+    # alt component + colorway combination.  This is the authoritative path
+    # for woven patch components (125802, 135956, 135957) whose thread colors
+    # live exclusively in the Detail Sketch pages of the PDF.
+    if comp_code and sketch_data:
+        sketch_color = get_sketch_color(sketch_data, comp_code, matched_cw)
+        if sketch_color:
+            return (comp_code, sketch_color)
+
+    # ── Final direct lookup via get_color_fn ──────────────────────────────────
     if comp_code:
         direct_color = get_color_fn(fallback_comp, matched_cw, color_raw)
         if direct_color and direct_color.lower() not in ("", "n/a", "nan"):
@@ -573,33 +663,6 @@ def _resolve_main_label_color_with_fallback(
     return ("", "")
 
 
-# ── Forward-fill helper ───────────────────────────────────────────────────────
-
-def _ffill_comp_col(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Return a copy of df with the first (component) column forward-filled.
-
-    Multi-page Color BOMs are concatenated into a single DataFrame by
-    _merge_color_bom_tables().  Continuation rows — those that carry colorway
-    data for a component whose name only appeared on the previous page — have
-    an empty Component cell.  Without forward-filling, every lookup that filters
-    on the Component column (in _resolve_alt_component_color and
-    get_color_from_spec / _lookup_in_df) silently misses these rows.
-
-    This is called ONCE per BOM inside validate_and_fill() and the result is
-    used in place of bom_data.get("color_bom") for all component-name lookups.
-    The raw DataFrame stored in bom_data is NOT mutated.
-    """
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    comp_col = out.columns[0]
-    _series = out[comp_col].astype(str).str.strip()
-    _series[_series.isin(["", "None", "nan"])] = pd.NA
-    out[comp_col] = _series.ffill().fillna("")
-    return out
-
-
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def validate_and_fill(
@@ -625,13 +688,7 @@ def validate_and_fill(
     color_spec      = bom_data.get("color_specification")
     sketch_data     = bom_data.get("detail_sketch", {})
 
-    # ── Pre-build forward-filled color BOM (fixes continuation-row lookups) ──
-    # Multi-page BOMs have blank Component cells on continuation rows.  All
-    # component-name lookups inside _resolve_alt_component_color and
-    # get_color_from_spec/_lookup_in_df must use this filled copy, not the raw
-    # DataFrame, so that Alt Hat Component 1C (and similar) are found correctly.
     color_bom_filled = _ffill_comp_col(bom_data.get("color_bom"))
-    # ─────────────────────────────────────────────────────────────────────────
 
     costing_hangtag_code = _validate_hangtag_from_costing(costing_detail)
     label_settings = bom_data.get("label_settings", {})
@@ -1118,10 +1175,6 @@ def validate_and_fill(
         upc_cw = get_cw_val("Packaging 3", matched_cw)
 
         # ── Alt component discovery ───────────────────────────────────────────
-        # Use _get_alt_names_from_color_bom() which forward-fills blank Component
-        # cells so that continuation rows (page-2 colorway columns) are correctly
-        # attributed to their component. Without this, "Alt Hat Component 1C" and
-        # similar names were invisible here, preventing FB3+ lookup entirely.
         _user_set_fb1 = bool(main_fallback_comp)
         _user_set_fb2 = bool(main_fallback_comp2)
         extra_alt_comps: list = []
@@ -1138,10 +1191,7 @@ def validate_and_fill(
                 main_fallback_comp2 = _alt_names[1].split(" - ")[0].strip()
                 use_main_fallback2  = True
 
-        # Alt components beyond the two FB slots (FB3, FB4, …).
-        # These are evaluated in the rich-color override pass below.
         extra_alt_comps = _alt_names[2:] if len(_alt_names) > 2 else []
-        # ── END alt component discovery ───────────────────────────────────────
 
         use_colorway_name_fallback = use_main_fallback or use_main_fallback2
 
@@ -1169,17 +1219,22 @@ def validate_and_fill(
 
         # ── Rich-color override ───────────────────────────────────────────────
         # Evaluate ALL alt components (FB1, FB2, FB3+) and keep whichever
-        # produces the richest (most comma-separated tokens) color string for
-        # this colorway. The color_bom_filled DataFrame is used throughout so
-        # that continuation rows (blank Component cell on page 2) are found.
+        # produces the richest (most comma-separated tokens) color string.
+        #
+        # FIX: Previously this loop never consulted the Detail Sketch for alt
+        # components that show "None" in the Color BOM, so the 5-thread colors
+        # from 135957 (e.g. for 447/342/310/845/256) were never considered and
+        # the shallower 128516 BOM colors won.  Now _resolve_alt_component_color
+        # falls through to the sketch, giving richness=5 which correctly beats
+        # the single-word BOM colors.
+        #
+        # FB3 (colorway name) is intentionally excluded from the richness loop:
+        # a raw colorway name like "Rainy Day" (richness=1) should NOT override
+        # a sketch result like "White, Collegiate Navy, Black, Phoenix Blue,
+        # Fathom Blue" (richness=5).
 
         _current_richness = _color_richness(main_color)
-
-        # _sap_code_for_cw: the SAP Material Code row in the Color BOM maps
-        # each colorway column to the material code for that colorway.
-        # Alt components (1A, 1B, 1C…) have blank Details cells so get_code()
-        # returns "". The SAP row is the authoritative final fallback.
-        _sap_code_for_cw = sap_codes.get(matched_cw, "")
+        _sap_code_for_cw  = sap_codes.get(matched_cw, "")
 
         # Pass 1 — compare FB1 and FB2 against what primary returned.
         for _fb_comp, _fb_raw in [
@@ -1194,7 +1249,6 @@ def validate_and_fill(
                 sketch_data=sketch_data,
             )
             if _color_richness(_fb_color) > _current_richness:
-                # Three-tier code lookup: name extraction → components{} → SAP row
                 _fb_code = (
                     get_code(_fb_comp)
                     or _extract_code_from_comp_name(_fb_raw or _fb_comp)
@@ -1206,29 +1260,20 @@ def validate_and_fill(
                     _current_richness = _color_richness(_fb_color)
 
         # Pass 2 — check extra alt components (FB3+).
-        # Three-tier code fallback: _resolve → get_code() → SAP codes row.
-        # Alt components have blank Details so the SAP row is essential.
         for _extra_full in extra_alt_comps:
-            _extra_comp = (
-                _extra_full.split(" - ")[0].strip()
-                if " - " in _extra_full else _extra_full
-            )
+            _extra_comp = _extra_full.split(" - ")[0].strip() if " - " in _extra_full else _extra_full
             _extra_code, _extra_color = _resolve_alt_component_color(
                 _extra_comp, _extra_full, matched_cw, color_raw,
                 color_bom_filled, color_spec, get_color_from_spec,
                 sketch_data=sketch_data,
             )
-            # Tier 2: components{} lookup
             if not _extra_code:
-                _extra_code = get_code(_extra_comp)
-            # Tier 3: SAP Material Code row from Color BOM
-            if not _extra_code:
-                _extra_code = _sap_code_for_cw
-
+                _extra_code = get_code(_extra_comp) or _sap_code_for_cw
             if _extra_code and _color_richness(_extra_color) > _current_richness:
                 resolved_main_code = _extra_code
                 main_color = _extra_color
                 _current_richness = _color_richness(_extra_color)
+
         # ── END rich-color override ───────────────────────────────────────────
 
         _is_hat_comp = any(
