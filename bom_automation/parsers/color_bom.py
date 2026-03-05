@@ -8,9 +8,16 @@ def extract_color_bom_lookup(color_bom_df: pd.DataFrame) -> Dict[str, Any]:
     Build nested lookup dict from Color BOM table. Best-effort header detection.
     Expected columns include 'Component', 'Details', 'Usage' and per-colorway columns.
 
-    BUG FIX: material code token extraction previously capped at len <= 6, which
+    BUG FIX 1: material code token extraction previously capped at len <= 6, which
     silently dropped 7-digit Columbia material codes (e.g. 1234567).
-    Fixed range: 4 <= len <= 7  (3-digit tokens are almost always quantities, not codes).
+    Fixed range: 4 <= len(t) <= 7  (3-digit tokens are almost always quantities, not codes).
+
+    BUG FIX 2: multi-page Color BOMs have continuation rows where the Component cell
+    is blank — the color data for that row belongs to the preceding named component.
+    Previously these rows were silently skipped (the `if not comp: continue` guard),
+    so any colorway columns that only appeared on page 2 of the BOM were never
+    populated for those components (e.g. Alt Hat Component 1C colors 447/342/310/845/256).
+    Fix: forward-fill the component column before iterating rows.
     """
     if color_bom_df is None or color_bom_df.empty:
         return {"SAP_codes": {}, "components": {}}
@@ -40,6 +47,24 @@ def extract_color_bom_lookup(color_bom_df: pd.DataFrame) -> Dict[str, Any]:
     details_col   = 'Details'   if 'Details'   in df.columns else None
     usage_col     = 'Usage'     if 'Usage'     in df.columns else None
 
+    # ── BUG FIX 2: forward-fill blank component names ────────────────────────
+    # When the Color BOM spans multiple Excel pages/tables that are concatenated
+    # into one DataFrame, continuation rows carry color data for the same
+    # component but have an empty Component cell.  Forward-filling propagates
+    # the last seen component name down to those rows so their colorway values
+    # are captured correctly.
+    #
+    # We only ffill values that are genuinely empty (empty string, "None",
+    # "nan") so that real blank rows between components are not mis-assigned.
+    _comp_series = df[component_col].astype(str).str.strip()
+    _empty_mask  = _comp_series.isin(["", "None", "nan"])
+    _comp_filled = _comp_series.copy()
+    _comp_filled[_empty_mask] = pd.NA        # mark truly-empty cells as NA
+    _comp_filled = _comp_filled.ffill()      # propagate last non-NA value downward
+    df = df.copy()
+    df[component_col] = _comp_filled.fillna("") # restore empty string for rows before first comp
+    # ── END BUG FIX 2 ────────────────────────────────────────────────────────
+
     for _, row in df.iterrows():
         comp = str(row.get(component_col, '')).strip()
         if not comp or 'sap material code' in comp.lower():
@@ -47,7 +72,7 @@ def extract_color_bom_lookup(color_bom_df: pd.DataFrame) -> Dict[str, Any]:
         details = str(row.get(details_col, '')).strip() if details_col else ''
         usage   = str(row.get(usage_col,   '')).strip() if usage_col   else ''
 
-        # ── FIX: extract material code token ─────────────────────────────────
+        # ── FIX 1: extract material code token ───────────────────────────────
         # Original: 3 <= len(t) <= 6  — missed all 7-digit codes.
         # Fix:      4 <= len(t) <= 7  — 3-digit tokens are quantities, not codes;
         #                               Columbia codes go up to 7 digits.
@@ -59,12 +84,27 @@ def extract_color_bom_lookup(color_bom_df: pd.DataFrame) -> Dict[str, Any]:
                 break
 
         colorways = {cw: str(row.get(cw, '')).strip() for cw in colorway_cols if cw in row}
-        lookup["components"][comp] = {
-            "material_code": material_code,
-            "description":   details,
-            "usage":         usage,
-            "colorways":     colorways,
-        }
+
+        if comp in lookup["components"]:
+            # ── Continuation row: merge colorway values into existing entry ──
+            # For each colorway column on this row, only overwrite if the
+            # existing value is empty — the first (page-1) row wins for shared
+            # columns, and page-2-only columns get filled in here.
+            existing_cw = lookup["components"][comp]["colorways"]
+            for cw, val in colorways.items():
+                if val and val.lower() not in ("", "none", "nan"):
+                    if not existing_cw.get(cw) or existing_cw[cw].lower() in ("", "none", "nan"):
+                        existing_cw[cw] = val
+            # Also backfill material_code if the first row didn't capture it
+            if material_code and not lookup["components"][comp]["material_code"]:
+                lookup["components"][comp]["material_code"] = material_code
+        else:
+            lookup["components"][comp] = {
+                "material_code": material_code,
+                "description":   details,
+                "usage":         usage,
+                "colorways":     colorways,
+            }
 
     return lookup
 

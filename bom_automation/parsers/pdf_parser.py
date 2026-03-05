@@ -328,19 +328,6 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
                     cw_name_col_idx = candidate + 1
                 break
 
-    # ── BUG 4 FIX: Section-aware accumulator ─────────────────────────────────
-    # The original code used a single colorway_map and single current_content_code
-    # for the entire document. When a Content Report has MULTIPLE CONTENT CODE
-    # sections (e.g. S8V for colorway 278, LAZ for colorways 624/465/342/...),
-    # all colorways were lumped into one map and assigned the same code — wrong.
-    #
-    # Fix: flush and reset colorway_map + _composition_parts each time a new
-    # CONTENT CODE header is detected. Accumulate into a sections list and emit
-    # all rows at the end, one per (content_code, colorway) pairing.
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # Composition label detection — longest label checked first to avoid
-    # "lining" matching "fleece lining" rows.
     _COMPOSITION_LABELS = [
         ("fleece lining", "Fleece Lining"),
         ("faux fur",      "Faux Fur"),
@@ -357,15 +344,13 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
         r'colorway name',
     ]
 
-    # Per-section state — reset when a new CONTENT CODE header is found
-    sections: list = []            # list of (content_code, enriched_full, colorway_map)
+    sections: list = []
     current_content_code: str = ""
     current_content_full: str = ""
     colorway_map: dict = {}
-    _composition_parts: list = []  # accumulated "Label: text" strings for current section
+    _composition_parts: list = []
 
     def _flush_section():
-        """Save the current section to sections[] if it has data."""
         if current_content_code and colorway_map:
             _compo_suffix = (
                 "  " + "  ".join(_composition_parts) if _composition_parts else ""
@@ -379,24 +364,17 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
         if any(re.search(p, row_text) for p in _skip_patterns):
             pass
 
-        # ── Detect new CONTENT CODE section ──────────────────────────────────
         for cell in row:
             if "CONTENT CODE" in cell.upper():
                 m = re.search(r'CONTENT CODE[:\s]+(\w+)', cell, re.IGNORECASE)
                 if m:
-                    # Flush the previous section before starting a new one
                     _flush_section()
-
-                    # Reset state for the new section
                     current_content_code = m.group(1).strip()
                     current_content_full = cell.strip()
                     colorway_map = {}
                     _composition_parts = []
                 break
 
-        # ── Detect composition label rows (Shell / Lining / Fleece Lining / …) ──
-        # Rows look like: ["Shell:", "100% Acrylic", ..., "398", "Lime Glow"]
-        # or:             ["Lining:", "100% Polyester Exclusive of Trimming", ...]
         if row and len(row) >= 2:
             first_cell = row[0].strip().rstrip(":").lower()
             second_cell = row[1].strip() if len(row) > 1 else ""
@@ -411,7 +389,6 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
                             _composition_parts.append(label_str)
                         break
 
-        # ── Detect colorway number rows ───────────────────────────────────────
         cw_num = ""
         cw_name = ""
         if cw_num_col_idx is not None and len(row) > cw_num_col_idx:
@@ -419,17 +396,14 @@ def _parse_content_report_tables(tables: list) -> pd.DataFrame:
         if cw_name_col_idx is not None and len(row) > cw_name_col_idx:
             cw_name = row[cw_name_col_idx].strip()
 
-        # Only add each colorway number once per section (first-seen wins within section)
         if re.match(r'^\d{3}$', cw_num) and cw_num not in colorway_map:
             colorway_map[cw_num] = cw_name
 
-    # Flush the final section
     _flush_section()
 
     if not sections:
         return pd.DataFrame()
 
-    # Build output rows from ALL sections — each colorway gets its own section's code
     output_rows = []
     for (content_code, enriched_full, cw_map) in sections:
         for cw_num, cw_name in cw_map.items():
@@ -450,6 +424,19 @@ def _merge_color_bom_tables(tables: list) -> pd.DataFrame:
     Color BOM may span multiple PDF pages/tables with the same component rows
     but different colorway columns. Merge them horizontally by matching the
     Component column.
+
+    BUG FIX (positional fallback):
+    When a PDF page has NO component names at all (all blank — the entire page
+    is continuation data), forward-filling the Component column produces NaN
+    throughout because there is no prior non-null value to propagate from.
+    The resulting cw_map is empty (or contains only a 'nan' key), so
+    base[comp_col].apply(lambda v: cw_map.get(v, None)) returns None for every
+    component and the entire page's colorway data is silently lost.
+
+    Fix: after building the name-based cw_map, if it is empty, fall back to
+    POSITIONAL matching — align extra_df rows to base rows by index position.
+    This is correct because the PDF always lists components in the same order
+    on every page; the continuation page just omits the names.
     """
     dfs = [_rows_to_df(_clean_table(t)) for t in tables if t]
     dfs = [df for df in dfs if not df.empty]
@@ -497,27 +484,49 @@ def _merge_color_bom_tables(tables: list) -> pd.DataFrame:
             ]
 
         for cw_col in new_cw_cols:
+            # Forward-fill blank component names in extra_df.
+            # Page 2+ continuation rows have an empty Component column but
+            # belong to the preceding non-blank row.
+            _extra_filled = extra_df.copy()
+            _extra_filled[extra_comp_col] = (
+                _extra_filled[extra_comp_col]
+                .replace("", pd.NA).replace("None", pd.NA).replace("nan", pd.NA)
+                .ffill()
+            )
+
+            # Build name-based map: component_name -> colorway_cell_value
+            cw_map = {}
+            for _, row in _extra_filled.iterrows():
+                comp_val = str(row.get(extra_comp_col, "")).strip()
+                cell_val = str(row.get(cw_col, "")).strip()
+                if (comp_val and comp_val.lower() not in ("nan", "none", "")
+                        and cell_val and cell_val.lower() not in ("none", "nan", "")):
+                    cw_map[comp_val] = cell_val
+
+            # ── POSITIONAL FALLBACK ───────────────────────────────────────────
+            # When ALL Component cells on this extra page are blank, ffill
+            # leaves them as NaN (nothing to propagate from), so cw_map is
+            # empty.  In that case the rows are in the same ORDER as base rows,
+            # so we can match by position: extra row i -> base row i.
+            if not cw_map:
+                base_comps = list(base[comp_col].astype(str).str.strip())
+                extra_vals_list = list(_extra_filled[cw_col].astype(str).str.strip())
+                for i, comp_name in enumerate(base_comps):
+                    if i < len(extra_vals_list):
+                        val = extra_vals_list[i]
+                        if val and val.lower() not in ("none", "nan", ""):
+                            cw_map[comp_name] = val
+            # ── END POSITIONAL FALLBACK ───────────────────────────────────────
+
             if cw_col in base.columns:
                 # Column already exists — fill in any missing (None) values
-                cw_map = {}
-                for _, row in extra_df.iterrows():
-                    comp_val = str(row.get(extra_comp_col, "")).strip()
-                    cell_val = str(row.get(cw_col, "")).strip()
-                    if comp_val and cell_val and cell_val.lower() not in ("none", "nan", ""):
-                        cw_map[comp_val] = cell_val
                 mask = base[cw_col].isna() | base[cw_col].isin(["", "None", "nan"])
                 base.loc[mask, cw_col] = base.loc[mask, comp_col].apply(
                     lambda v: cw_map.get(str(v).strip(), None)
                 )
                 continue
 
-            # New column — build map and add it
-            cw_map = {}
-            for _, row in extra_df.iterrows():
-                comp_val = str(row.get(extra_comp_col, "")).strip()
-                cell_val = str(row.get(cw_col, "")).strip()
-                if comp_val and cell_val and cell_val.lower() not in ("none", "nan", ""):
-                    cw_map[comp_val] = cell_val
+            # New column — add it
             base[cw_col] = base[comp_col].apply(
                 lambda v: cw_map.get(str(v).strip(), None)
             )
@@ -633,9 +642,6 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
                 result["content_report"] = _parse_content_report_tables(tables)
                 continue
 
-            # FIX: use horizontal merge for color BOMs so colorways that span
-            # multiple PDF pages are merged into a single DataFrame instead of
-            # being stacked (which left most colorway cells as None).
             if section in ("color_bom", "colorless_bom"):
                 result[section] = _merge_color_bom_tables(tables)
                 continue
