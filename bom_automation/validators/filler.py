@@ -611,8 +611,9 @@ def _resolve_alt_component_color(
 def _resolve_main_label_color_with_fallback(
     primary_comp, fallback_comp, fallback_raw_sel,
     fallback_comp2, fallback_raw_sel2,
+    fallback_comp3, fallback_raw_sel3,
     matched_cw, color_raw, color_bom_df, color_spec_df, get_color_fn,
-    use_fb1=False, use_fb2=False, use_colorway_name=False, sketch_data=None,
+    use_fb1=False, use_fb2=False, use_fb3=False, use_colorway_name=False, sketch_data=None,
 ):
     primary_color = get_color_fn(primary_comp, matched_cw, color_raw)
     if primary_color and primary_color.lower() in _COLOR_REDIRECT_VALUES:
@@ -635,6 +636,13 @@ def _resolve_main_label_color_with_fallback(
                 )
                 if fb2_color and fb2_color.lower() not in ("n/a", ""):
                     return (fb1_code, fb2_color)
+            if use_fb3 and fallback_comp3:
+                _, fb3_color = _resolve_alt_component_color(
+                    fallback_comp3, fallback_raw_sel3, matched_cw, color_raw,
+                    color_bom_df, color_spec_df, get_color_fn, sketch_data=sketch_data,
+                )
+                if fb3_color and fb3_color.lower() not in ("n/a", ""):
+                    return (fb1_code, fb3_color)
             if use_colorway_name and matched_cw:
                 stripped = _strip_numeric_prefix(matched_cw)
                 if stripped and stripped.lower() not in ("n/a", ""):
@@ -649,11 +657,32 @@ def _resolve_main_label_color_with_fallback(
         if fb2_code:
             if fb2_color and fb2_color.lower() not in ("n/a", ""):
                 return (fb2_code, fb2_color)
+            if use_fb3 and fallback_comp3:
+                _, fb3_color = _resolve_alt_component_color(
+                    fallback_comp3, fallback_raw_sel3, matched_cw, color_raw,
+                    color_bom_df, color_spec_df, get_color_fn, sketch_data=sketch_data,
+                )
+                if fb3_color and fb3_color.lower() not in ("n/a", ""):
+                    return (fb2_code, fb3_color)
             if use_colorway_name and matched_cw:
                 stripped = _strip_numeric_prefix(matched_cw)
                 if stripped and stripped.lower() not in ("n/a", ""):
                     return (fb2_code, stripped)
             return (fb2_code, "")
+
+    if use_fb3 and fallback_comp3:
+        fb3_code, fb3_color = _resolve_alt_component_color(
+            fallback_comp3, fallback_raw_sel3, matched_cw, color_raw,
+            color_bom_df, color_spec_df, get_color_fn, sketch_data=sketch_data,
+        )
+        if fb3_code:
+            if fb3_color and fb3_color.lower() not in ("n/a", ""):
+                return (fb3_code, fb3_color)
+            if use_colorway_name and matched_cw:
+                stripped = _strip_numeric_prefix(matched_cw)
+                if stripped and stripped.lower() not in ("n/a", ""):
+                    return (fb3_code, stripped)
+            return (fb3_code, "")
 
     if use_colorway_name and matched_cw:
         stripped = _strip_numeric_prefix(matched_cw)
@@ -1053,6 +1082,13 @@ def validate_and_fill(
             if raw_main_fallback2 and raw_main_fallback2 not in ("N/A", "") else ""
         )
 
+        raw_main_fallback3  = label_settings.get("main_label_fallback3", "")
+        use_main_fallback3  = bool(label_settings.get("use_main_label_fallback3", False))
+        main_fallback_comp3 = (
+            raw_main_fallback3.split(" - ")[0].strip()
+            if raw_main_fallback3 and raw_main_fallback3 not in ("N/A", "") else ""
+        )
+
         main_comp, main_id = split_comp(raw_main)
         care_comp, care_id = split_comp(raw_care)
         ht_comp,   ht_id   = split_comp(raw_ht)
@@ -1177,11 +1213,12 @@ def validate_and_fill(
         # ── Alt component discovery ───────────────────────────────────────────
         _user_set_fb1 = bool(main_fallback_comp)
         _user_set_fb2 = bool(main_fallback_comp2)
+        _user_set_fb3 = bool(main_fallback_comp3)
         extra_alt_comps: list = []
 
         _alt_names = _get_alt_names_from_color_bom(color_bom_filled)
 
-        if not _user_set_fb1 or not _user_set_fb2:
+        if not _user_set_fb1 or not _user_set_fb2 or not _user_set_fb3:
             if not _user_set_fb1 and len(_alt_names) > 0:
                 raw_main_fallback  = _alt_names[0]
                 main_fallback_comp = _alt_names[0].split(" - ")[0].strip()
@@ -1190,15 +1227,21 @@ def validate_and_fill(
                 raw_main_fallback2  = _alt_names[1]
                 main_fallback_comp2 = _alt_names[1].split(" - ")[0].strip()
                 use_main_fallback2  = True
+            if not _user_set_fb3 and len(_alt_names) > 2:
+                raw_main_fallback3  = _alt_names[2]
+                main_fallback_comp3 = _alt_names[2].split(" - ")[0].strip()
+                use_main_fallback3  = True
 
-        extra_alt_comps = _alt_names[2:] if len(_alt_names) > 2 else []
+        extra_alt_comps = _alt_names[3:] if len(_alt_names) > 3 else []
 
-        use_colorway_name_fallback = use_main_fallback or use_main_fallback2
+        use_colorway_name_fallback = use_main_fallback or use_main_fallback2 or use_main_fallback3
 
         _effective_fb1     = main_fallback_comp
         _effective_fb1_raw = raw_main_fallback or _effective_fb1
         _effective_fb2     = main_fallback_comp2
         _effective_fb2_raw = raw_main_fallback2 or _effective_fb2
+        _effective_fb3     = main_fallback_comp3
+        _effective_fb3_raw = raw_main_fallback3 or _effective_fb3
 
         resolved_main_code, main_color = _resolve_main_label_color_with_fallback(
             primary_comp=main_comp,
@@ -1206,6 +1249,8 @@ def validate_and_fill(
             fallback_raw_sel=_effective_fb1_raw,
             fallback_comp2=_effective_fb2,
             fallback_raw_sel2=_effective_fb2_raw,
+            fallback_comp3=_effective_fb3,
+            fallback_raw_sel3=_effective_fb3_raw,
             matched_cw=matched_cw,
             color_raw=color_raw,
             color_bom_df=color_bom_filled,
@@ -1213,6 +1258,7 @@ def validate_and_fill(
             get_color_fn=get_color_from_spec,
             use_fb1=use_main_fallback,
             use_fb2=use_main_fallback2,
+            use_fb3=use_main_fallback3,
             use_colorway_name=use_colorway_name_fallback,
             sketch_data=sketch_data,
         )
@@ -1240,6 +1286,7 @@ def validate_and_fill(
         for _fb_comp, _fb_raw in [
             (_effective_fb1, _effective_fb1_raw),
             (_effective_fb2, _effective_fb2_raw),
+            (_effective_fb3, _effective_fb3_raw),
         ]:
             if not _fb_comp:
                 continue
@@ -1387,12 +1434,14 @@ def validate_and_fill(
             else:
                 result.at[idx, "Validation Status"] = "✅ Validated"
         elif label_has_value and color_missing:
-            if not use_main_fallback and not use_main_fallback2:
-                fallback_note = " — enable Fallback 1 or Fallback 2 (alt component) in Settings"
-            elif not use_main_fallback2:
-                fallback_note = " — enable Fallback 2 (second alt component) in Settings"
+            if not use_main_fallback and not use_main_fallback2 and not use_main_fallback3:
+                fallback_note = " ? enable Fallback 1, 2, or 3 (alt component) in Settings"
+            elif not use_main_fallback2 and not use_main_fallback3:
+                fallback_note = " ? enable Fallback 2 or Fallback 3 (alt component) in Settings"
+            elif not use_main_fallback3:
+                fallback_note = " ? enable Fallback 3 (alt component) in Settings"
             else:
-                fallback_note = " — all fallbacks active but color not found"
+                fallback_note = " ? all fallbacks active but color not found"
             result.at[idx, "Validation Status"] = f"⚠️ Partial: Main Label Color missing{fallback_note}"
         elif not_found > 0:
             result.at[idx, "Validation Status"] = "⚠️ Partial"

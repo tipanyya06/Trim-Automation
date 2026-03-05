@@ -519,8 +519,8 @@ def render_comparison_tab():
                 st.markdown(
                     "<div style='font-size:0.78rem;color:#5f7a9e;margin-bottom:0.5rem;line-height:1.45;'>"
                     "When the primary component lookup returns no color, these fallbacks are tried "
-                    "<b>in order</b>. Fallback 3 (colorway name) activates automatically when "
-                    "Fallback 1 or Fallback 2 is enabled."
+                    "<b>in order</b>. Fallback 4 (colorway name) activates automatically when "
+                    "Fallback 1, 2, or 3 is enabled."
                     "</div>",
                     unsafe_allow_html=True,
                 )
@@ -529,12 +529,23 @@ def render_comparison_tab():
                 if ("hat component" in _main_norm) or ("117027" in _main_norm):
                     fb1_auto = next((o for o in na_opts if "alt hat component 1a" in str(o).lower()), None)
                     fb2_auto = next((o for o in na_opts if "alt hat component 1b" in str(o).lower()), None)
+                    fb3_auto = next((o for o in na_opts if "alt hat component 1c" in str(o).lower()), None)
+
+                    def _is_na(v):
+                        return str(v).strip().lower() in ("", "n/a", "none", "nan")
+
+                    fb1_empty = (fb1_auto is None) or _is_na(saved.get("main_label_fallback", ""))
+                    fb2_empty = (fb2_auto is None) or _is_na(saved.get("main_label_fallback2", ""))
+
                     if fb1_auto:
                         st.session_state[f"main_label_fallback_{style_key}"] = fb1_auto
                         st.session_state[f"use_main_label_fallback_{style_key}"] = True
                     if fb2_auto:
                         st.session_state[f"main_label_fallback2_{style_key}"] = fb2_auto
                         st.session_state[f"use_main_label_fallback2_{style_key}"] = True
+                    if fb3_auto and fb1_empty and fb2_empty:
+                        st.session_state[f"main_label_fallback3_{style_key}"] = fb3_auto
+                        st.session_state[f"use_main_label_fallback3_{style_key}"] = True
 
                 fb1_col_a, fb1_col_b = st.columns([3, 1])
                 with fb1_col_a:
@@ -568,12 +579,29 @@ def render_comparison_tab():
                         key=f"use_main_label_fallback2_{style_key}",
                     )
 
+                fb3_col_a, fb3_col_b = st.columns([3, 1])
+                with fb3_col_a:
+                    fb3_sel = st.selectbox(
+                        "Fallback 3 ??? Alt component for color lookup",
+                        options=na_opts,
+                        index=na_opts.index(saved.get("main_label_fallback3", "N/A"))
+                            if saved.get("main_label_fallback3", "N/A") in na_opts else 0,
+                        key=f"main_label_fallback3_{style_key}",
+                    )
+                with fb3_col_b:
+                    use_fb3 = st.checkbox(
+                        "Enable",
+                        value=bool(saved.get("use_main_label_fallback3", False)),
+                        key=f"use_main_label_fallback3_{style_key}",
+                    )
+
+
                 st.markdown(
                     "<div style='font-size:0.78rem;color:#3a5278;padding:0.38rem 0 0.1rem 0;"
                     "font-weight:600;'>"
-                    "Fallback 3 — Use colorway name (strip numeric prefix) "
+                    "Fallback 4 — Use colorway name (strip numeric prefix) "
                     "<span style='font-size:0.7rem;color:#7090b4;font-weight:400;'>"
-                    "— auto-enabled when FB1 or FB2 is on</span>"
+                    "— auto-enabled when FB1, FB2, or FB3 is on</span>"
                     "</div>"
                     "<div style='font-size:0.74rem;color:#7090b4;line-height:1.35;margin-bottom:0.3rem;'>"
                     "e.g. matched colorway <code>262-Canoe, Mountains</code> "
@@ -610,6 +638,8 @@ def render_comparison_tab():
                     "use_main_label_fallback":     use_fb1,
                     "main_label_fallback2":        fb2_sel,
                     "use_main_label_fallback2":    use_fb2,
+                    "main_label_fallback3":        fb3_sel,
+                    "use_main_label_fallback3":    use_fb3,
                     "tp_status":      tp_status,
                     "tp_date":        tp_date,
                     "product_status": prod_status,
