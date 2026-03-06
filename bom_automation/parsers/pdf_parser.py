@@ -265,6 +265,16 @@ def _build_supplier_lookup(costing_detail_df: pd.DataFrame) -> Dict[str, str]:
             elif len(supplier) > len(lookup[key]):
                 lookup[key] = supplier
 
+    # Prefer strict columns to avoid mismatched suppliers
+    desc_col = None
+    comp_col = None
+    for c in original_cols:
+        cl = str(c).lower()
+        if desc_col is None and ("description" in cl or cl == "desc" or "details" in cl):
+            desc_col = c
+        if comp_col is None and (cl == "component" or cl.startswith("component")):
+            comp_col = c
+
     for _, row in df.iterrows():
         supplier_raw = str(row.get(supplier_col, "")).strip()
         if not supplier_raw or supplier_raw.lower() in ("nan", "none", ""):
@@ -276,11 +286,10 @@ def _build_supplier_lookup(costing_detail_df: pd.DataFrame) -> Dict[str, str]:
         if material_col:
             mat_cell = str(row.get(material_col, "")).strip()
             found_codes = _extract_codes_from_cell(mat_cell)
-        if not found_codes:
-            for col in original_cols:
-                if col == supplier_col:
-                    continue
-                found_codes.update(_extract_codes_from_cell(str(row.get(col, ""))))
+        if not found_codes and desc_col:
+            found_codes = _extract_codes_from_cell(str(row.get(desc_col, "")))
+        if not found_codes and comp_col:
+            found_codes = _extract_codes_from_cell(str(row.get(comp_col, "")))
 
         for code in found_codes:
             _register(code, supplier)
@@ -548,8 +557,9 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
         costing_detail_rows: list = []
         costing_detail_header = None
         tables_by_section: Dict[str, list] = {}
+        page_sections: list = []
 
-        for page in pdf.pages:
+        for page_idx, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
             section = _detect_section(text)
             try:
@@ -560,6 +570,13 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 if lines:
                     page_tables = [[[line] for line in lines]]
+            title_line = next((l.strip() for l in (text.splitlines() if text else []) if l.strip()), "")
+            page_sections.append({
+                "Page": page_idx,
+                "Section": section.replace("_", " ").title(),
+                "Tables": len(page_tables),
+                "Title": title_line,
+            })
 
             for tbl in page_tables:
                 if not tbl:
@@ -664,6 +681,7 @@ def parse_bom_pdf(pdf_file_obj) -> Dict[str, Any]:
 
         result["supplier_lookup"] = _build_supplier_lookup(result.get("costing_detail", pd.DataFrame()))
         result["detail_sketch"] = parse_detail_sketch_pages(pdf_file_obj)
+        result["page_sections"] = page_sections
 
         return result
 

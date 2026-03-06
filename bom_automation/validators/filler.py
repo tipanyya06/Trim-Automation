@@ -110,7 +110,7 @@ def _fix_sup(s: str) -> str:
     while prev != s:
         prev = s
         s = re.sub(
-            r'([a-z]{3,})\s+([a-z]{1,3})(?=\s|$)',
+            r'([a-z]{3,})\s+([a-z]{1,3})(-=\s|$)',
             lambda m: (
                 m.group(1) + m.group(2)
                 if not re.search(r'[aeiou]', m.group(2)) or len(m.group(2)) == 1
@@ -196,9 +196,9 @@ def _strip_numeric_prefix(color_name: str) -> str:
     if m:
         s = m.group(1).strip()
     # Remove trailing noise suffixes: ", Logo" / ", Marled" / "Marled" alone
-    s = re.sub(r',?\s*\bLogo\b\s*$', '', s, flags=re.IGNORECASE).strip()
-    s = re.sub(r',?\s*\bMarled\b\s*$', '', s, flags=re.IGNORECASE).strip()
-    s = re.sub(r',?\s*\bNeps\b\s*$', '', s, flags=re.IGNORECASE).strip()
+    s = re.sub(r',-\s*\bLogo\b\s*$', '', s, flags=re.IGNORECASE).strip()
+    s = re.sub(r',-\s*\bMarled\b\s*$', '', s, flags=re.IGNORECASE).strip()
+    s = re.sub(r',-\s*\bNeps\b\s*$', '', s, flags=re.IGNORECASE).strip()
     return s
 
 
@@ -243,6 +243,112 @@ def _find_target_col(df, matched_cw: str):
         if overlap > best_overlap:
             best_overlap, best_col = overlap, col
     return best_col if best_overlap > 0 else None
+
+
+def _find_target_col_strict(df, matched_cw: str):
+    """
+    Strict column resolver: only exact colorway or numeric-prefix match.
+    Avoids word-overlap guesses that can pick the wrong column.
+    """
+    cw_cols = [c for c in df.columns[1:] if c]
+    if matched_cw in cw_cols:
+        return matched_cw
+    num_prefix = re.match(r'^(\d+)', str(matched_cw) or "")
+    num_prefix = num_prefix.group(1) if num_prefix else ""
+    if num_prefix:
+        for col in cw_cols:
+            col_num = re.match(r'^(\d+)', str(col))
+            if col_num and col_num.group(1) == num_prefix:
+                return col
+    return None
+
+
+def _get_logo1_color_strict(
+    component_name: str,
+    matched_cw: str,
+    color_bom_df: pd.DataFrame,
+    color_spec_df: pd.DataFrame,
+    debug_color: Optional[list] = None,
+    bom_style: str = "",
+) -> str:
+    """Strict lookup for Label Logo 1: use matched column value only, no redirects/fallbacks."""
+    if not component_name:
+        return ""
+    lookup_name = (
+        component_name.split(" - ")[0].strip()
+        if " - " in component_name else component_name
+    )
+    lookup_lower = lookup_name.strip().lower()
+    if not lookup_lower.startswith("label logo 1"):
+        return ""
+    def _details_col(df: pd.DataFrame):
+        for c in df.columns[1:]:
+            cl = str(c).strip().lower()
+            if cl in ("details", "description", "desc"):
+                return c
+        return df.columns[1] if len(df.columns) > 1 else None
+
+    # Try by component name first.
+    for df in (color_bom_df, color_spec_df):
+        if df is None or df.empty:
+            continue
+        comp_col = df.columns[0]
+        row_match = df[df[comp_col].apply(
+            lambda v: str(v).strip().lower().startswith(lookup_lower)
+        )]
+        if not row_match.empty:
+            target_col = _find_target_col_strict(df, matched_cw)
+            if target_col is None:
+                continue
+            cell_val = str(row_match.iloc[0].get(target_col, "")).strip()
+            if debug_color is not None:
+                debug_color.append({
+                    "Style": bom_style or "N/A",
+                    "Component": component_name,
+                    "Matched Component": str(row_match.iloc[0].get(comp_col, "")),
+                    "Table": "color_bom" if df is color_bom_df else "color_spec",
+                    "Colorway": matched_cw,
+                    "Column": target_col,
+                    "Cell": cell_val,
+                    "Strict": "label_logo_1",
+                })
+            if cell_val and cell_val.lower() not in ("none", "nan", ""):
+                return cell_val
+
+    # Fallback: if we only have the ID, match by details/description column.
+    logo_id = _extract_id_from_settings_string(component_name)
+    if not logo_id:
+        m = re.search(r'\b(\d{4,7})\b', component_name)
+        logo_id = m.group(1) if m else ""
+    if logo_id:
+        for df in (color_bom_df, color_spec_df):
+            if df is None or df.empty:
+                continue
+            comp_col = df.columns[0]
+            det_col = _details_col(df)
+            if not det_col:
+                continue
+            row_match = df[df[det_col].astype(str).str.contains(logo_id, na=False)]
+            if row_match.empty:
+                continue
+            target_col = _find_target_col_strict(df, matched_cw)
+            if target_col is None:
+                continue
+            cell_val = str(row_match.iloc[0].get(target_col, "")).strip()
+            if debug_color is not None:
+                debug_color.append({
+                    "Style": bom_style or "N/A",
+                    "Component": component_name,
+                    "Matched Component": str(row_match.iloc[0].get(comp_col, "")),
+                    "Table": "color_bom" if df is color_bom_df else "color_spec",
+                    "Colorway": matched_cw,
+                    "Column": target_col,
+                    "Cell": cell_val,
+                    "Strict": "label_logo_1_id",
+                })
+            if cell_val and cell_val.lower() not in ("none", "nan", ""):
+                return cell_val
+    return ""
 
 
 # ── Color richness helper ─────────────────────────────────────────────────────
@@ -344,6 +450,18 @@ def _find_supplier_in_costing(costing_df, code: str) -> str:
     if not sup_col:
         return "N/A"
 
+    mat_col = None
+    desc_col = None
+    comp_col = None
+    for col in costing_df.columns:
+        cl = str(col).strip().lower()
+        if mat_col is None and cl in ("material", "material code", "mat code", "mat"):
+            mat_col = col
+        if desc_col is None and ("description" in cl or cl == "desc" or "details" in cl):
+            desc_col = col
+        if comp_col is None and (cl == "component" or cl.startswith("component")):
+            comp_col = col
+
     def _cell_has_code(cell_str):
         s = str(cell_str).strip()
         if not s or s.lower() in ("nan", "none", ""):
@@ -355,9 +473,18 @@ def _find_supplier_in_costing(costing_df, code: str) -> str:
         digits = re.sub(r'[^\d]', '', s)
         return digits == code or (bool(code_stripped) and digits == code_stripped)
 
+    # Prefer exact match in Material column if present
+    if mat_col:
+        for _, row in costing_df.iterrows():
+            if _cell_has_code(str(row.get(mat_col, ""))):
+                sup = _fix_sup(str(row.get(sup_col, "")).strip())
+                if sup and sup.lower() not in ("", "nan", "none"):
+                    return sup
+
+    # Fallback: only scan Description / Component columns (avoid whole-row false matches)
     for _, row in costing_df.iterrows():
-        for col in costing_df.columns:
-            if col == sup_col:
+        for col in (desc_col, comp_col):
+            if not col or col == sup_col:
                 continue
             if _cell_has_code(str(row.get(col, ""))):
                 sup = _fix_sup(str(row.get(sup_col, "")).strip())
@@ -575,12 +702,12 @@ def _resolve_alt_component_color(
         cell_val = str(row_match.iloc[0].get(target_col, "")).strip()
         cell_lower = cell_val.lower()
         if not cell_val or cell_lower in ("", "none", "nan"):
-            # Continuation row / no data — continue to next df, do NOT return yet.
+            # Continuation row / no data - continue to next df, do NOT return yet.
             # After the loop, we will try the Detail Sketch.
             bom_cell_found = True  # we found the row, just no color value
             continue
         if cell_lower in _COLOR_REDIRECT_VALUES:
-            # ── FIX: also try sketch before falling back to colorway name ────
+            # -- FIX: also try sketch before falling back to colorway name --
             if sketch_data and comp_code:
                 sketch_color = get_sketch_color(sketch_data, comp_code, matched_cw)
                 if sketch_color:
@@ -589,7 +716,7 @@ def _resolve_alt_component_color(
             return (comp_code, color)
         return (comp_code, cell_val)
 
-    # ── FIX: Detail Sketch fallback ───────────────────────────────────────────
+    # -- FIX: Detail Sketch fallback --
     # Reached when BOM/color_spec has no color data (None/empty) for this
     # alt component + colorway combination.  This is the authoritative path
     # for woven patch components (125802, 135956, 135957) whose thread colors
@@ -598,6 +725,7 @@ def _resolve_alt_component_color(
         sketch_color = get_sketch_color(sketch_data, comp_code, matched_cw)
         if sketch_color:
             return (comp_code, sketch_color)
+
 
     # ── Final direct lookup via get_color_fn ──────────────────────────────────
     if comp_code:
@@ -613,7 +741,23 @@ def _resolve_main_label_color_with_fallback(
     fallback_comp3, fallback_raw_sel3,
     matched_cw, color_raw, color_bom_df, color_spec_df, get_color_fn,
     use_fb1=False, use_fb2=False, use_fb3=False, use_colorway_name=False, sketch_data=None,
+    debug_color=None, bom_style="",
 ):
+    # Strict rule for Label Logo 1: use matched column value only.
+    if str(primary_comp).strip().lower().startswith("label logo 1"):
+        strict_color = _get_logo1_color_strict(
+            primary_comp,
+            matched_cw,
+            color_bom_df,
+            color_spec_df,
+            debug_color=debug_color,
+            bom_style=bom_style,
+        )
+        if strict_color:
+            return ("", strict_color)
+        # Do not fall back to other rows or colorway name for Label Logo 1.
+        return ("", "")
+
     primary_color = get_color_fn(primary_comp, matched_cw, color_raw)
     if primary_color and primary_color.lower() in _COLOR_REDIRECT_VALUES:
         primary_color = _strip_numeric_prefix(matched_cw)
@@ -715,6 +859,7 @@ def validate_and_fill(
     bom_style       = str(bom_data.get("metadata", {}).get("style", "")).strip().upper()
     color_spec      = bom_data.get("color_specification")
     sketch_data     = bom_data.get("detail_sketch", {})
+    debug_color     = bom_data.get("_debug_color") if isinstance(bom_data.get("_debug_color"), list) else None
 
     color_bom_filled = _ffill_comp_col(bom_data.get("color_bom"))
 
@@ -786,7 +931,7 @@ def validate_and_fill(
         cw_prefix = _extract_prefix(raw_color_option) or _extract_prefix(matched_cw)
         exact_cw  = matched_cw
 
-        def _lookup_in_df(df):
+        def _lookup_in_df(df, table_label):
             if df is None or df.empty:
                 return ""
             comp_col = df.columns[0]
@@ -802,17 +947,25 @@ def validate_and_fill(
                 raw_lower = raw.strip().lower()
                 if raw_lower == lookup_lower:
                     return True
+                # Prevent Label Logo 1 from matching Label 1 (shorter prefix)
+                if lookup_lower.startswith("label logo 1"):
+                    return raw_lower.startswith(lookup_lower)
                 if raw_lower.startswith(lookup_lower) or lookup_lower.startswith(raw_lower):
                     return True
                 return False
 
             row_match = df[df[comp_col].apply(_strict_match)]
             if row_match.empty:
-                row_match = df[df[comp_col].apply(
-                    lambda v: _comp_names_match(
-                        str(v).split(" - ")[0] if " - " in str(v) else str(v), lookup_name
-                    )
-                )]
+                if lookup_lower.startswith("label logo 1"):
+                    row_match = df[df[comp_col].apply(
+                        lambda v: str(v).strip().lower().startswith(lookup_lower)
+                    )]
+                else:
+                    row_match = df[df[comp_col].apply(
+                        lambda v: _comp_names_match(
+                            str(v).split(" - ")[0] if " - " in str(v) else str(v), lookup_name
+                        )
+                    )]
 
                 _non_color_hints = ("store", "outlet", "retail", "channel", "vendor", "factory")
                 if not row_match.empty:
@@ -838,6 +991,16 @@ def validate_and_fill(
 
             if exact_cw in cw_cols:
                 v = str(row_match.iloc[0][exact_cw]).strip()
+                if debug_color is not None:
+                    debug_color.append({
+                        "Style": bom_style or "N/A",
+                        "Component": component_name,
+                        "Matched Component": str(row_match.iloc[0].get(comp_col, "")),
+                        "Table": table_label,
+                        "Colorway": matched_cw,
+                        "Column": exact_cw,
+                        "Cell": v,
+                    })
                 if v and _accept(v):
                     return v
                 if v.lower() in _COLOR_REDIRECT_VALUES:
@@ -846,6 +1009,16 @@ def validate_and_fill(
                 for col in cw_cols:
                     if str(col).split("-")[0].strip() == cw_prefix:
                         v = str(row_match.iloc[0][col]).strip()
+                        if debug_color is not None:
+                            debug_color.append({
+                                "Style": bom_style or "N/A",
+                                "Component": component_name,
+                                "Matched Component": str(row_match.iloc[0].get(comp_col, "")),
+                                "Table": table_label,
+                                "Colorway": matched_cw,
+                                "Column": col,
+                                "Cell": v,
+                            })
                         if v and _accept(v):
                             return v
                         if v.lower() in _COLOR_REDIRECT_VALUES:
@@ -864,11 +1037,11 @@ def validate_and_fill(
 
             return ""
 
-        res = _lookup_in_df(color_bom_filled)
+        res = _lookup_in_df(color_bom_filled, "color_bom")
         if not res:
-            res = _lookup_in_df(color_spec)
+            res = _lookup_in_df(color_spec, "color_spec")
         if not res:
-            res = _lookup_in_df(bom_data.get("colorless_bom"))
+            res = _lookup_in_df(bom_data.get("colorless_bom"), "colorless_bom")
         return res
 
     def _extract_num_prefix(s: str) -> str:
@@ -914,6 +1087,25 @@ def validate_and_fill(
             parts = str(sel).rsplit(" - ", 1)
             return parts[0].strip(), parts[1].strip()
         return (str(sel) if sel else ""), ""
+
+    def _find_comp_by_id(_code: str) -> str:
+        if not _code or _code in ("N/A", ""):
+            return ""
+        for _df in (color_bom_filled, color_spec):
+            if _df is None or _df.empty:
+                continue
+            _det_col = None
+            for c in _df.columns[1:]:
+                cl = str(c).strip().lower()
+                if cl in ("details", "description", "desc"):
+                    _det_col = c
+                    break
+            if _det_col is None:
+                continue
+            _hits = _df[_df[_det_col].astype(str).str.contains(str(_code), na=False)]
+            if not _hits.empty:
+                return str(_hits.iloc[0].get(_df.columns[0], "")).strip()
+        return ""
 
     def _resolve_settings_code(raw_setting: str, *costing_fallback_keywords) -> str:
         if not raw_setting or raw_setting in ("N/A", ""):
@@ -1103,6 +1295,10 @@ def validate_and_fill(
         else:
             main_code = get_code(main_comp) if main_comp else "N/A"
 
+        # If the ID maps to a different component name in BOM, prefer that for logic.
+        _comp_from_id = _find_comp_by_id(main_code)
+        _primary_comp_for_color = _comp_from_id or main_comp
+
         # ── care_code_mat — multi-stage resolution ────────────────────────────
         care_code_mat = care_id if care_id else (get_code(care_comp) if care_comp else "")
 
@@ -1243,7 +1439,7 @@ def validate_and_fill(
         _effective_fb3_raw = raw_main_fallback3 or _effective_fb3
 
         resolved_main_code, main_color = _resolve_main_label_color_with_fallback(
-            primary_comp=main_comp,
+            primary_comp=_primary_comp_for_color,
             fallback_comp=_effective_fb1,
             fallback_raw_sel=_effective_fb1_raw,
             fallback_comp2=_effective_fb2,
@@ -1260,7 +1456,20 @@ def validate_and_fill(
             use_fb3=use_main_fallback3,
             use_colorway_name=use_colorway_name_fallback,
             sketch_data=sketch_data,
+            debug_color=debug_color,
+            bom_style=bom_style,
         )
+        if debug_color is not None:
+            debug_color.append({
+                "Style": bom_style or "N/A",
+                "Component": main_comp,
+                "Matched Component": main_comp,
+                "Table": "main_label",
+                "Colorway": matched_cw,
+                "Column": "n/a",
+                "Cell": main_color,
+                "Strict": "main_label_resolved",
+            })
 
         # ── Rich-color override ───────────────────────────────────────────────
         # Evaluate ALL alt components (FB1, FB2, FB3+) and keep whichever
@@ -1280,30 +1489,32 @@ def validate_and_fill(
 
         _current_richness = _color_richness(main_color)
         _sap_code_for_cw  = sap_codes.get(matched_cw, "")
+        _main_is_logo1 = str(_primary_comp_for_color).strip().lower().startswith("label logo 1")
 
         # Pass 1 — compare FB1 and FB2 against what primary returned.
-        for _fb_comp, _fb_raw in [
-            (_effective_fb1, _effective_fb1_raw),
-            (_effective_fb2, _effective_fb2_raw),
-            (_effective_fb3, _effective_fb3_raw),
-        ]:
-            if not _fb_comp:
-                continue
-            _, _fb_color = _resolve_alt_component_color(
-                _fb_comp, _fb_raw, matched_cw, color_raw,
-                color_bom_filled, color_spec, get_color_from_spec,
-                sketch_data=sketch_data,
-            )
-            if _color_richness(_fb_color) > _current_richness:
-                _fb_code = (
-                    get_code(_fb_comp)
-                    or _extract_code_from_comp_name(_fb_raw or _fb_comp)
-                    or _sap_code_for_cw
+        if not _main_is_logo1:
+            for _fb_comp, _fb_raw in [
+                (_effective_fb1, _effective_fb1_raw),
+                (_effective_fb2, _effective_fb2_raw),
+                (_effective_fb3, _effective_fb3_raw),
+            ]:
+                if not _fb_comp:
+                    continue
+                _, _fb_color = _resolve_alt_component_color(
+                    _fb_comp, _fb_raw, matched_cw, color_raw,
+                    color_bom_filled, color_spec, get_color_from_spec,
+                    sketch_data=sketch_data,
                 )
-                if _fb_code:
-                    resolved_main_code = _fb_code
-                    main_color = _fb_color
-                    _current_richness = _color_richness(_fb_color)
+                if _color_richness(_fb_color) > _current_richness:
+                    _fb_code = (
+                        get_code(_fb_comp)
+                        or _extract_code_from_comp_name(_fb_raw or _fb_comp)
+                        or _sap_code_for_cw
+                    )
+                    if _fb_code:
+                        resolved_main_code = _fb_code
+                        main_color = _fb_color
+                        _current_richness = _color_richness(_fb_color)
 
         # Pass 2 — check extra alt components (FB3+).
         for _extra_full in extra_alt_comps:
@@ -1357,7 +1568,7 @@ def validate_and_fill(
                 _suppress = False
 
         # If main label is Label Logo 1 and the matched color cell is literally 'None', force N/A output.
-        _main_is_logo = "label logo 1" in str(main_comp).lower() or "label logo 1" in str(raw_main).lower()
+        _main_is_logo = "label logo 1" in str(_primary_comp_for_color).lower() or "label logo 1" in str(raw_main).lower()
         _main_logo_none = False
         if _main_is_logo:
             for _df in (color_bom_filled, color_spec):
@@ -1372,7 +1583,7 @@ def validate_and_fill(
                     _row_match = _df[_df[_comp_col].apply(_ms)]
                 if _row_match.empty:
                     continue
-                _target_col = _find_target_col(_df, matched_cw)
+                _target_col = _find_target_col_strict(_df, matched_cw)
                 if _target_col is None:
                     continue
                 _cell = str(_row_match.iloc[0].get(_target_col, "")).strip().lower()
@@ -1465,13 +1676,13 @@ def validate_and_fill(
                 result.at[idx, "Validation Status"] = "✅ Validated"
         elif label_has_value and color_missing:
             if not use_main_fallback and not use_main_fallback2 and not use_main_fallback3:
-                fallback_note = " ? enable Fallback 1, 2, or 3 (alt component) in Settings"
+                fallback_note = " - enable Fallback 1, 2, or 3 (alt component) in Settings"
             elif not use_main_fallback2 and not use_main_fallback3:
-                fallback_note = " ? enable Fallback 2 or Fallback 3 (alt component) in Settings"
+                fallback_note = " - enable Fallback 2 or Fallback 3 (alt component) in Settings"
             elif not use_main_fallback3:
-                fallback_note = " ? enable Fallback 3 (alt component) in Settings"
+                fallback_note = " - enable Fallback 3 (alt component) in Settings"
             else:
-                fallback_note = " ? all fallbacks active but color not found"
+                fallback_note = " - all fallbacks active but color not found"
             result.at[idx, "Validation Status"] = f"⚠️ Partial: Main Label Color missing{fallback_note}"
         elif not_found > 0:
             result.at[idx, "Validation Status"] = "⚠️ Partial"

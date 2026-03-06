@@ -407,10 +407,13 @@ def show_bom_inspector(style_key, bom_data):
         f'</div></div>',
         unsafe_allow_html=True,
     )
+
     section_keys = [
         k for k, v in bom_data.items()
         if k not in ("metadata", "supplier_lookup") and isinstance(v, pd.DataFrame) and not v.empty
     ]
+    section_keys = list(section_keys)
+    section_keys.append("parsed_pages")
     if not section_keys:
         render_warn_banner("No parsed sections for this BOM.")
         return
@@ -420,7 +423,10 @@ def show_bom_inspector(style_key, bom_data):
     for i in range(0, len(section_keys), 4):
         cols = st.columns(len(section_keys[i:i+4]))
         for j, sec in enumerate(section_keys[i:i+4]):
-            label = f"{sec.replace('_', ' ').title()} ({len(bom_data.get(sec, pd.DataFrame()))})"
+            if sec == "parsed_pages":
+                label = "Parsed Pages"
+            else:
+                label = f"{sec.replace('_', ' ').title()} ({len(bom_data.get(sec, pd.DataFrame()))})"
             with cols[j]:
                 if st.button(label, key=f"popup_tab_{style_key}_{sec}",
                              type="primary" if st.session_state[ssk] == sec else "secondary",
@@ -428,6 +434,22 @@ def show_bom_inspector(style_key, bom_data):
                     st.session_state[ssk] = sec
                     st.rerun()
     active = st.session_state.get(ssk, section_keys[0])
+    if active == "parsed_pages":
+        page_sections = bom_data.get("page_sections", [])
+        df_pages = pd.DataFrame(page_sections) if page_sections else pd.DataFrame([{
+            "Page": "N/A", "Section": "N/A", "Tables": "N/A", "Title": "N/A",
+        }])
+        st.markdown(
+            f"<div class='cx-meta'>Parsed Pages &middot; {len(df_pages)} rows &middot; {len(df_pages.columns)} cols</div>",
+            unsafe_allow_html=True,
+        )
+        _render_popup_table(df_pages)
+        _, cc = st.columns([8, 1])
+        with cc:
+            if st.button("Close", width="stretch"):
+                st.session_state["inspect_popup_style"] = None
+                st.rerun()
+        return
     search = st.text_input("Filter rows", key=f"popup_filter_{style_key}", placeholder="Filter rows...")
     vdf    = bom_data[active].copy()
     if active == "costing_detail" and not vdf.empty:

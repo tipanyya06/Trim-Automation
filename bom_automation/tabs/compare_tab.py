@@ -817,6 +817,11 @@ def render_comparison_tab():
 
     render_pagination(cmp_page_key, cmp_page, total_cmp_pages, key_suffix="cmp_ql", show_page_text=True)
 
+    color_debug = st.session_state.get("__color_debug", [])
+    if color_debug:
+        with st.expander("Color Lookup Debug", expanded=False):
+            st.dataframe(pd.DataFrame(color_debug), use_container_width=True, hide_index=True)
+
     render_divider()
     st.markdown("""<div class="cx-meta">Run Validation</div>""", unsafe_allow_html=True)
     run_col1, run_col2 = st.columns(2)
@@ -850,6 +855,7 @@ def render_comparison_tab():
         label_sels_norm = {str(k).strip().upper(): v for k, v in label_sels.items()}
         result_parts = []
         missing_settings = []
+        color_debug = []
         for style_val, group_df in renamed_df.groupby("Buyer Style Number", sort=False):
             style_str = str(style_val).strip().upper()
             matched_bom_key, matched_bom = _find_matching_bom(style_str, bom_dict)
@@ -888,6 +894,7 @@ def render_comparison_tab():
             # KEY FIX: pass care_label through selected_care_label_comp so the
             # bom_data fallback path in filler.py always has a value to work with.
             bom_with_labels["selected_care_label_comp"]  = per_style_settings.get("care_label")  if use_settings else None
+            bom_with_labels["_debug_color"]              = color_debug
 
             product_type = "standard"
             if material_col and material_col in group_df.columns:
@@ -948,6 +955,7 @@ def render_comparison_tab():
             )
         st.session_state["validation_result"] = combined
         st.session_state["validation_mode"]   = "Trim (Purchasing)" if use_settings else "Quick Trim (Planning)"
+        st.session_state["__color_debug"]    = color_debug
         if use_settings and missing_settings:
             uniq = sorted(set(missing_settings))
             msg = "Missing saved settings for style(s): " + ", ".join(uniq[:20]) + (" ..." if len(uniq) > 20 else "") + ". These styles fell back to auto-detect defaults."
