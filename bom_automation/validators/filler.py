@@ -365,7 +365,6 @@ def _find_supplier_in_costing(costing_df, code: str) -> str:
                     return sup
     return "N/A"
 
-
 def _find_code_in_costing_by_desc(costing_df, *keywords) -> str:
     if costing_df is None or costing_df.empty:
         return ""
@@ -1357,14 +1356,44 @@ def validate_and_fill(
             else:
                 _suppress = False
 
+        # If main label is Label Logo 1 and the matched color cell is literally 'None', force N/A output.
+        _main_is_logo = "label logo 1" in str(main_comp).lower() or "label logo 1" in str(raw_main).lower()
+        _main_logo_none = False
+        if _main_is_logo:
+            for _df in (color_bom_filled, color_spec):
+                if _df is None or _df.empty:
+                    continue
+                _comp_col = _df.columns[0]
+                _row_match = _df[_df[_comp_col].apply(lambda v: _comp_names_match(str(v), main_comp))]
+                if _row_match.empty:
+                    def _ms(v):
+                        _np = str(v).split(" - ")[0].strip() if " - " in str(v) else str(v)
+                        return _comp_names_match(_np, main_comp)
+                    _row_match = _df[_df[_comp_col].apply(_ms)]
+                if _row_match.empty:
+                    continue
+                _target_col = _find_target_col(_df, matched_cw)
+                if _target_col is None:
+                    continue
+                _cell = str(_row_match.iloc[0].get(_target_col, "")).strip().lower()
+                if _cell == "none":
+                    _main_logo_none = True
+                elif _cell not in ("", "nan"):  # explicit value that's not None
+                    _main_logo_none = False
+                if _main_logo_none or _cell not in ("", "nan"):
+                    break
+        if _main_logo_none:
+            effective_main_code = "N/A"
+            main_color = "N/A"
+
         _care_comp_for_color = care_comp if care_comp else "Label 1"
         care_color = get_color_from_spec(_care_comp_for_color, matched_cw, color_raw)
 
         logo_color = get_color_from_spec("Label Logo 1", matched_cw, color_raw)
 
-        result.at[idx, "Main Label"]          = effective_main_code
-        result.at[idx, "Main Label Color"]    = "N/A" if _suppress else (main_color or "N/A")
-        result.at[idx, "Main Label Supplier"] = "N/A" if _suppress else resolve_supplier(effective_main_code, "main_label")
+        result.at[idx, "Main Label"]          = "N/A" if _main_logo_none else effective_main_code
+        result.at[idx, "Main Label Color"]    = "N/A" if (_suppress or _main_logo_none) else (main_color or "N/A")
+        result.at[idx, "Main Label Supplier"] = "N/A" if (_suppress or _main_logo_none) else resolve_supplier(effective_main_code, "main_label")
 
         result.at[idx, "Main Label 2- Gloves"]  = logo_code  if is_glove else "N/A"
         result.at[idx, "Main Label Color2"]     = logo_color if is_glove else "N/A"
@@ -1408,6 +1437,7 @@ def validate_and_fill(
 
         result.at[idx, "UPC Bag Sticker (Polybag)"] = upc_code or extract_id_only(upc_cw) or "N/A"
         result.at[idx, "UPC Supplier"]              = resolve_supplier(upc_code) if upc_code else "N/A"
+
 
         for field, key in [("TP STATUS", "tp_status"), ("TP DATE", "tp_date"),
                            ("PRODUCT STATUS", "product_status"), ("REMARKS", "remarks")]:

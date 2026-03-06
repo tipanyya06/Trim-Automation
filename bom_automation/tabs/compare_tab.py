@@ -198,6 +198,75 @@ def _normalize_supplier_names(df):
             lambda v: "PT BSN" if isinstance(v, str) and "bao shen" in v.strip().lower() else v
         )
     return out
+def _ensure_default_settings_for_styles(style_keys, bom_dict, show_hangtag_rfid):
+    """Seed per-style settings so validation works even if settings UI was not opened."""
+    label_selections = st.session_state.get("label_selections", {})
+
+    def _pick_option(options, *keywords, fallback=None):
+        for kw in keywords:
+            kw_l = str(kw).lower()
+            for opt in options:
+                if kw_l in str(opt).lower():
+                    return opt
+        return fallback if fallback is not None else (options[0] if options else "N/A")
+
+    def _best(saved_val, preferred_names, _comps, exclude_alt=False):
+        if saved_val and saved_val in _comps:
+            return saved_val
+        for p in preferred_names:
+            p_l = p.lower()
+            for c in _comps:
+                c_l = c.lower()
+                if p_l in c_l:
+                    if exclude_alt and c_l.startswith("alt"):
+                        continue
+                    return c
+        return _comps[0] if _comps else "N/A"
+
+    for style_key in style_keys:
+        if style_key in label_selections and label_selections[style_key]:
+            continue
+        bom_data_s = bom_dict.get(style_key)
+        if not bom_data_s:
+            continue
+        components = _get_components_for_bom(bom_data_s)
+        if not components:
+            continue
+        na_opts = ["N/A"] + components
+
+        main_sel = _best("", ["label logo 1", "hat components", "hat component", "direct embroidery", "label 1", "main label"], components, exclude_alt=True)
+        care_sel = _best("", ["label 1 -", "label 1", "care content label", "care label"], components, exclude_alt=True)
+        hangtag_default = _pick_option(na_opts, "hangtag package part", "hangtag", fallback="N/A")
+        rfid_sticker_default = _pick_option(na_opts, "121612", "123130", "rfid sticker", "rfid tag", fallback="N/A")
+        upc_default = _pick_option(na_opts, "980010", "packaging 3", "upc", "polybag", fallback="N/A")
+
+        label_selections[style_key] = {
+            "main_label":                main_sel,
+            "add_main_label":            "N/A",
+            "hangtag":                   hangtag_default,
+            "hangtag2":                  "N/A",
+            "hangtag3":                  "N/A",
+            "micropack":                 "N/A",
+            "size_label":                "N/A",
+            "size_sticker":              "N/A",
+            "care_label":                care_sel,
+            "hangtag_rfid":              "N/A" if not show_hangtag_rfid else "N/A",
+            "rfid_no_msrp":              "N/A",
+            "rfid_sticker":              rfid_sticker_default,
+            "upc_sticker":               upc_default,
+            "main_label_fallback":       "N/A",
+            "use_main_label_fallback":   False,
+            "main_label_fallback2":      "N/A",
+            "use_main_label_fallback2":  False,
+            "main_label_fallback3":      "N/A",
+            "use_main_label_fallback3":  False,
+            "tp_status":                 "",
+            "tp_date":                   "",
+            "product_status":            "",
+            "remarks":                   "",
+        }
+
+    st.session_state["label_selections"] = label_selections
 
 
 def render_comparison_tab():
@@ -307,6 +376,8 @@ def render_comparison_tab():
     st.markdown("<div style='height:0;'></div>", unsafe_allow_html=True)
     label_selections = st.session_state.get("label_selections", {})
     all_style_keys   = list(bom_dict.keys())
+    _ensure_default_settings_for_styles(all_style_keys, bom_dict, show_hangtag_rfid)
+    label_selections = st.session_state.get("label_selections", {})
     total_styles     = len(all_style_keys)
     total_lm_pages   = max(1, -(-total_styles // STYLES_PER_PAGE))
     lm_page          = max(0, min(st.session_state.get("label_map_page", 0), total_lm_pages - 1))
@@ -416,8 +487,10 @@ def render_comparison_tab():
                         ["label logo 1", "hat components", "hat component", "direct embroidery", "label 1", "main label"],
                         exclude_alt=True,
                     )
-                    main_sel = st.selectbox("Main Label", options=components,
-                        index=components.index(_main_default) if _main_default in components else 0,
+                    main_options = ["N/A"] + components
+                    _main_default = saved.get("main_label", "") if saved.get("main_label", "") in main_options else _main_default
+                    main_sel = st.selectbox("Main Label", options=main_options,
+                        index=main_options.index(_main_default) if _main_default in main_options else 0,
                         key=f"main_label_{style_key}")
                 with r1b:
                     add_main_sel = st.selectbox("Additional Main Label", options=na_opts,
@@ -774,7 +847,9 @@ def render_comparison_tab():
         rename_map = {style_col: "Buyer Style Number", color_col: "Color/Option"}
         renamed_df = comp_df.rename(columns=rename_map)
         label_sels = st.session_state.get("label_selections", {}) if use_settings else {}
+        label_sels_norm = {str(k).strip().upper(): v for k, v in label_sels.items()}
         result_parts = []
+        missing_settings = []
         for style_val, group_df in renamed_df.groupby("Buyer Style Number", sort=False):
             style_str = str(style_val).strip().upper()
             matched_bom_key, matched_bom = _find_matching_bom(style_str, bom_dict)
@@ -788,6 +863,15 @@ def render_comparison_tab():
                 continue
 
             per_style_settings = label_sels.get(matched_bom_key, {}) if use_settings else {}
+            if use_settings and not per_style_settings:
+                per_style_settings = label_sels_norm.get(str(matched_bom_key).strip().upper(), {})
+            if use_settings and not per_style_settings:
+                for _k, _v in label_sels.items():
+                    if _styles_match(str(_k), str(matched_bom_key)):
+                        per_style_settings = _v
+                        break
+            if use_settings and not per_style_settings:
+                missing_settings.append(matched_bom_key)
 
             # ── FIX: Defensive care label passthrough ─────────────────────────
             # When use_settings=True but per_style_settings is empty (e.g. the
@@ -864,6 +948,10 @@ def render_comparison_tab():
             )
         st.session_state["validation_result"] = combined
         st.session_state["validation_mode"]   = "Trim (Purchasing)" if use_settings else "Quick Trim (Planning)"
+        if use_settings and missing_settings:
+            uniq = sorted(set(missing_settings))
+            msg = "Missing saved settings for style(s): " + ", ".join(uniq[:20]) + (" ..." if len(uniq) > 20 else "") + ". These styles fell back to auto-detect defaults."
+            render_warn_banner(msg)
 
     if run_quick:
         with st.spinner("Running Quick Trim (Planning)..."):

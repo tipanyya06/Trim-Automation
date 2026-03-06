@@ -37,8 +37,13 @@ def render_pdf_tab():
     bom_dict        = st.session_state.get("bom_dict", {})
     pdf_bytes_store = st.session_state.get("pdf_bytes_store", {})
     pdf_hashes      = st.session_state.get("pdf_hashes", {})
-    pdf_data_list   = [(f.name, f.read()) for f in uploaded_pdfs]
-    current_fnames  = {fname for fname, _ in pdf_data_list}
+
+    pdf_data_list = []
+    for f in uploaded_pdfs:
+        raw = f.read()
+        fhash = hashlib.md5(raw).hexdigest()
+        pdf_data_list.append((f.name, raw, fhash))
+    current_fnames = {fname for fname, _, _ in pdf_data_list}
 
     # Remove stale BOMs from removed files
     stale_hashes = {pdf_hashes.pop(fn) for fn in list(pdf_hashes) if fn not in current_fnames}
@@ -48,14 +53,13 @@ def render_pdf_tab():
             bom_dict.pop(style, None)
             pdf_bytes_store.pop(style, None)
 
-    to_parse          = [(fn, rb, hashlib.md5(rb).hexdigest()) for fn, rb in pdf_data_list if pdf_hashes.get(fn) != hashlib.md5(rb).hexdigest()]
+    to_parse = [(fn, rb, fh) for fn, rb, fh in pdf_data_list if pdf_hashes.get(fn) != fh]
     pending_conflicts = st.session_state.get("pending_conflicts", None)
 
     if to_parse and not pending_conflicts:
         seen_fhashes   = set()
         unique, dups   = [], []
-        for idx, (fn, rb) in enumerate(pdf_data_list):
-            fh = hashlib.md5(rb).hexdigest()
+        for idx, (fn, rb, fh) in enumerate(pdf_data_list):
             if fh in seen_fhashes:
                 dups.append((fn, rb, fh, idx))
             else:

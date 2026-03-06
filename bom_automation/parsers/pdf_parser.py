@@ -276,7 +276,6 @@ def _build_supplier_lookup(costing_detail_df: pd.DataFrame) -> Dict[str, str]:
         if material_col:
             mat_cell = str(row.get(material_col, "")).strip()
             found_codes = _extract_codes_from_cell(mat_cell)
-
         if not found_codes:
             for col in original_cols:
                 if col == supplier_col:
