@@ -20,8 +20,6 @@ from .utils import (
     STYLES_PER_PAGE, QUICK_SETTING_FIELDS, QUICK_SETTING_LABELS,
     HANGTAG_RFID_OUTPUT_COLS,
 )
-
-
 def _get_components_for_bom(bom_data):
     from parsers.color_bom import extract_color_bom_lookup
     components = []
