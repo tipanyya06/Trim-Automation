@@ -76,20 +76,29 @@ def render_pdf_tab():
             with ThreadPoolExecutor(max_workers=min(8, total)) as ex:
                 def _pp(args):
                     fn, rb, fh, idx = args
-                    bd    = _parse_bom_pdf_cached(rb)
-                    style = bd.get("metadata", {}).get("style") or fn
-                    return (fn, idx), style, bd, rb, fh
+                    try:
+                        bd    = _parse_bom_pdf_cached(rb)
+                        style = bd.get("metadata", {}).get("style") or fn
+                        return (fn, idx), style, bd, rb, fh
+                    except Exception as e:
+                        # Return error indicator instead of crashing
+                        return (fn, idx), f"ERROR: {fn}", {}, rb, fh
                 for fut in as_completed({ex.submit(_pp, a): a[0] for a in unique}):
-                    key, style, bd, rb, fh = fut.result()
-                    pre_parsed[key] = (style, bd, rb, fh)
-                    parsed_styles.append(style)
-                    done += 1
-                    bar.progress(done / total, text=f"Parsed {done} / {total}")
-                    txt.markdown(
-                        f"<div style='font-size:0.78rem;color:#9ca3af;'>✓ {', '.join(parsed_styles[-3:])}"
-                        f"{'...' if len(parsed_styles) > 3 else ''}</div>",
-                        unsafe_allow_html=True,
-                    )
+                    try:
+                        key, style, bd, rb, fh = fut.result()
+                        pre_parsed[key] = (style, bd, rb, fh)
+                        if not style.startswith("ERROR"):
+                            parsed_styles.append(style)
+                        done += 1
+                        bar.progress(done / total, text=f"Parsed {done} / {total}")
+                        txt.markdown(
+                            f"<div style='font-size:0.78rem;color:#9ca3af;'>✓ {', '.join(parsed_styles[-3:])}"
+                            f"{'...' if len(parsed_styles) > 3 else ''}</div>",
+                            unsafe_allow_html=True,
+                        )
+                    except Exception:
+                        done += 1
+                        bar.progress(done / total, text=f"Parsed {done} / {total} (with errors)")
             bar.progress(1.0, text=f"✅ Done — {len(parsed_styles)} BOM(s) parsed")
             txt.empty()
 
