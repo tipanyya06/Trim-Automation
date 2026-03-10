@@ -18,3 +18,8 @@ port = 8501
 maxUploadSize = 200
 runOnSave = true
 enableXsrfProtection = true
+scriptRunContext.script_arg_queue_timeout = 300
+
+[client]
+toolbarMode = "auto"
+showErrorDetails = true
