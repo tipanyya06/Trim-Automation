@@ -4,7 +4,19 @@ Automated Bill of Materials extraction, comparison, validation, and QA for Colum
 
 ---
 
-## 🚀 Quick Start
+## � Complete User Guide
+
+**For detailed instructions on how to use the system, including:**
+- Step-by-step workflow for each tab
+- How color and style matching works
+- Understanding validation status
+- Common questions and troubleshooting
+
+👉 **See [USER_GUIDE.md](USER_GUIDE.md)** ← Start here if you're new!
+
+---
+
+## �🚀 Quick Start
 
 ### 1. Install & Run
 
