@@ -1,0 +1,20 @@
+[client]
+showErrorDetails = true
+toolbarMode = "auto"
+
+[logger]
+level = "info"
+
+[theme]
+primaryColor = "#3569de"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f2f6"
+textColor = "#1a2b45"
+font = "sans serif"
+
+[server]
+headless = true
+port = 8501
+maxUploadSize = 200
+runOnSave = true
+enableXsrfProtection = true
