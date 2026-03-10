@@ -5,7 +5,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import streamlit as st
 
-from parsers.pdf_parser import parse_bom_pdf as _parse_bom_pdf_raw
+# Lazy import - only load when pdf_tab is actually rendered
+def _get_pdf_parser():
+    from parsers.pdf_parser import parse_bom_pdf as parse_func
+    return parse_func
+
 from .utils import (
     render_section_header, render_divider, render_info_banner,
     render_pagination, render_view_toggle,
@@ -18,6 +22,7 @@ from .utils import (
 @st.cache_data(show_spinner=False, max_entries=50)
 def _parse_bom_pdf_cached(raw_bytes: bytes):
     import io
+    _parse_bom_pdf_raw = _get_pdf_parser()
     return _parse_bom_pdf_raw(io.BytesIO(raw_bytes))
 
 
@@ -161,22 +166,12 @@ def render_pdf_tab():
         sects = [k for k, v in bom.items() if k not in ("metadata", "supplier_lookup") and isinstance(v, pd.DataFrame) and not v.empty]
         cb    = bom.get("color_bom", pd.DataFrame())
         
-        # Check if detail sketch is available
-        has_detail_sketch = False
-        try:
-            detail_sketch = bom.get("detail_sketch")
-            if detail_sketch and isinstance(detail_sketch, dict) and len(detail_sketch) > 0:
-                has_detail_sketch = True
-        except:
-            has_detail_sketch = False
-        
         summary_rows.append({
             "Style": style, "Season": meta.get("season", "\u2014"),
             "Design": meta.get("design", "\u2014"), "LO": meta.get("production_lo", "\u2014"),
             "Color": _style_color_hint(bom),
             "Sections": len(sects),
             "Colorways": len(cb.columns) if not cb.empty else 0,
-            "Detail Sketch": "✓" if has_detail_sketch else "✗",
             "Status": _style_validation_status(style),
         })
 
@@ -210,8 +205,6 @@ def render_pdf_tab():
         status     = row.get("Status", _style_validation_status(style))
         bg, border, fg, label = _status_style(status)
         accent     = _status_accent_color(label)
-        detail_sketch_val = row.get("Detail Sketch", "—")
-        detail_sketch_color = "#90EE90" if detail_sketch_val == "✓" else "#FFB6C6"
 
         with deck_cols[idx % col_count]:
             if view_mode == "List":
@@ -232,7 +225,6 @@ def render_pdf_tab():
                     f'<span class="cx-chip">LO: {row["LO"]}</span>'
                     f'<span class="cx-chip">⊞ {row["Sections"]} Sections</span>'
                     f'<span class="cx-chip">◇ {row["Colorways"]} Colorways</span>'
-                    f'<span class="cx-chip" style="background:{detail_sketch_color};">📄 Sketch: {detail_sketch_val}</span>'
                     f'</div></div></div>',
                     unsafe_allow_html=True,
                 )
@@ -250,7 +242,6 @@ def render_pdf_tab():
                     f'<span class="cx-chip">Color: {row.get("Color","N/A")}</span>'
                     f'<span class="cx-chip">Season: {row["Season"]}</span>'
                     f'<span class="cx-chip">LO: {row["LO"]}</span>'
-                    f'<span class="cx-chip" style="background:{detail_sketch_color};">📄 Sketch: {detail_sketch_val}</span>'
                     f'</div>'
                     f'<div class="cx-style-footer" style="margin-top:8px;border-top:1px solid #f0f4f8;padding-top:8px;">'
                     f'<div class="cx-footer-meta">'
