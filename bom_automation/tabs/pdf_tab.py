@@ -201,6 +201,8 @@ def render_pdf_tab():
         status     = row.get("Status", _style_validation_status(style))
         bg, border, fg, label = _status_style(status)
         accent     = _status_accent_color(label)
+        detail_sketch_val = row.get("Detail Sketch", "—")
+        detail_sketch_color = "#90EE90" if detail_sketch_val == "✓" else "#FFB6C6"
 
         with deck_cols[idx % col_count]:
             if view_mode == "List":
@@ -221,7 +223,7 @@ def render_pdf_tab():
                     f'<span class="cx-chip">LO: {row["LO"]}</span>'
                     f'<span class="cx-chip">⊞ {row["Sections"]} Sections</span>'
                     f'<span class="cx-chip">◇ {row["Colorways"]} Colorways</span>'
-                    f'<span class="cx-chip" style="background:{"#90EE90" if row.get("Detail Sketch") == "✓" else "#FFB6C6"};">📄 Sketch: {row.get("Detail Sketch","—")}</span>'
+                    f'<span class="cx-chip" style="background:{detail_sketch_color};">📄 Sketch: {detail_sketch_val}</span>'
                     f'</div></div></div>',
                     unsafe_allow_html=True,
                 )
@@ -239,7 +241,7 @@ def render_pdf_tab():
                     f'<span class="cx-chip">Color: {row.get("Color","N/A")}</span>'
                     f'<span class="cx-chip">Season: {row["Season"]}</span>'
                     f'<span class="cx-chip">LO: {row["LO"]}</span>'
-                    f'<span class="cx-chip" style="background:{"#90EE90" if row.get("Detail Sketch") == "✓" else "#FFB6C6"};">📄 Sketch: {row.get("Detail Sketch","—")}</span>'
+                    f'<span class="cx-chip" style="background:{detail_sketch_color};">📄 Sketch: {detail_sketch_val}</span>'
                     f'</div>'
                     f'<div class="cx-style-footer" style="margin-top:8px;border-top:1px solid #f0f4f8;padding-top:8px;">'
                     f'<div class="cx-footer-meta">'
