@@ -320,11 +320,12 @@ def render_sidebar():
             )
             for style, bom in bom_dict.items():
                 meta = bom.get("metadata", {})
+                em_dash = "—"
                 st.markdown(
                     f'<div style="font-size:0.75rem;color:#6d82a1;padding:4px 0;border-bottom:1px solid #d8e1ec;">'
                     f'<span style="color:#3b82f6;font-weight:700;">{style}</span>'
-                    f' &nbsp;\xb7&nbsp; {meta.get("season", "\u2014")}'
-                    f' &nbsp;\xb7&nbsp; {meta.get("production_lo", "\u2014")}</div>',
+                    f' · {meta.get("season", em_dash)}'
+                    f' · {meta.get("production_lo", em_dash)}</div>',
                     unsafe_allow_html=True,
                 )
         else:
