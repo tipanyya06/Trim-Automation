@@ -151,12 +151,23 @@ def render_pdf_tab():
         meta = bom.get("metadata", {})
         sects = [k for k, v in bom.items() if k not in ("metadata", "supplier_lookup") and isinstance(v, pd.DataFrame) and not v.empty]
         cb    = bom.get("color_bom", pd.DataFrame())
+        
+        # Check if detail sketch is available
+        has_detail_sketch = False
+        try:
+            detail_sketch = bom.get("detail_sketch")
+            if detail_sketch and isinstance(detail_sketch, dict) and len(detail_sketch) > 0:
+                has_detail_sketch = True
+        except:
+            has_detail_sketch = False
+        
         summary_rows.append({
             "Style": style, "Season": meta.get("season", "\u2014"),
             "Design": meta.get("design", "\u2014"), "LO": meta.get("production_lo", "\u2014"),
             "Color": _style_color_hint(bom),
             "Sections": len(sects),
             "Colorways": len(cb.columns) if not cb.empty else 0,
+            "Detail Sketch": "✓" if has_detail_sketch else "✗",
             "Status": _style_validation_status(style),
         })
 
@@ -210,6 +221,7 @@ def render_pdf_tab():
                     f'<span class="cx-chip">LO: {row["LO"]}</span>'
                     f'<span class="cx-chip">⊞ {row["Sections"]} Sections</span>'
                     f'<span class="cx-chip">◇ {row["Colorways"]} Colorways</span>'
+                    f'<span class="cx-chip" style="background:{"#90EE90" if row.get("Detail Sketch") == "✓" else "#FFB6C6"};">📄 Sketch: {row.get("Detail Sketch","—")}</span>'
                     f'</div></div></div>',
                     unsafe_allow_html=True,
                 )
@@ -227,6 +239,7 @@ def render_pdf_tab():
                     f'<span class="cx-chip">Color: {row.get("Color","N/A")}</span>'
                     f'<span class="cx-chip">Season: {row["Season"]}</span>'
                     f'<span class="cx-chip">LO: {row["LO"]}</span>'
+                    f'<span class="cx-chip" style="background:{"#90EE90" if row.get("Detail Sketch") == "✓" else "#FFB6C6"};">📄 Sketch: {row.get("Detail Sketch","—")}</span>'
                     f'</div>'
                     f'<div class="cx-style-footer" style="margin-top:8px;border-top:1px solid #f0f4f8;padding-top:8px;">'
                     f'<div class="cx-footer-meta">'
