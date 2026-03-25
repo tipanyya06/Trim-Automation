@@ -26,10 +26,26 @@ The app helps teams move from raw BOM PDFs to validated output files in one Stre
 
 ```bash
 pip install -r requirements.txt
-streamlit run bom_automation/app.py
+streamlit run bom_automation/app.py --server.address 127.0.0.1 --server.port 8501
 ```
 
 Open: http://localhost:8501
+
+## Run Modes (Local And Deployed)
+
+- Local dev (localhost only):
+
+```bash
+streamlit run bom_automation/app.py --server.address 127.0.0.1 --server.port 8501
+```
+
+- Deployed/default behavior (no forced localhost binding):
+
+```bash
+streamlit run bom_automation/app.py
+```
+
+The shared `.streamlit/config.toml` intentionally does not hardcode `server.address`, so deployment settings are not impacted.
 
 ## Dev Dependency Note
 

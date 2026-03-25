@@ -58,10 +58,24 @@ If Java or Ghostscript is missing, core app features may still run, but specific
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-streamlit run bom_automation/app.py
+streamlit run bom_automation/app.py --server.address 127.0.0.1 --server.port 8501
 ```
 
 App URL: http://localhost:8501
+
+Local dev (localhost only) command:
+
+```powershell
+streamlit run bom_automation/app.py --server.address 127.0.0.1 --server.port 8501
+```
+
+Deployed/default command (do not force localhost):
+
+```powershell
+streamlit run bom_automation/app.py
+```
+
+Note: `.streamlit/config.toml` should not hardcode `server.address` so deployed environments can bind correctly.
 
 ### Docker
 
