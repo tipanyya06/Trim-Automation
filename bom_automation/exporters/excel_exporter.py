@@ -165,7 +165,7 @@ def export_to_excel(result_df: pd.DataFrame, original_df: pd.DataFrame) -> bytes
             for col_idx, col_name in enumerate(orig_cols):
                 max_len = max(
                     len(str(col_name)),
-                    original_df[col_name].astype(str).map(len).max() if not original_df.empty else 0,
+                    original_df[col_name].map(lambda x: len(str(x)) if pd.notna(x) else 0).max() if not original_df.empty else 0,
                 )
                 ws_orig.set_column(col_idx, col_idx, min(max_len + 2, 50))
 
